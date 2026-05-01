@@ -1,0 +1,77 @@
+diff --git a/modules/api/api.py b/modules/api/api.py
+index 36ca151..d4fbf00 100644
+--- a/modules/api/api.py
++++ b/modules/api/api.py
+@@ -129,6 +129,17 @@ def encode_pil_to_base64(image):
+     return base64.b64encode(bytes_data)
+ 
+ 
++def encode_processed_video_for_api(processed, send_images: bool) -> str | None:
++    """WAN / video pipelines set Processed.video_path to an on-disk MP4 or MKV; API clients need the bytes."""
++    if not send_images:
++        return None
++    vp = getattr(processed, "video_path", None)
++    if not vp or not os.path.isfile(vp):
++        return None
++    with open(vp, "rb") as f:
++        return base64.b64encode(f.read()).decode("ascii")
++
++
+ def api_middleware(app: FastAPI):
+     rich_available = False
+     try:
+@@ -495,7 +506,12 @@ class Api:
+ 
+         b64images = list(map(encode_pil_to_base64, processed.images + processed.extra_images)) if send_images else []
+ 
+-        return models.TextToImageResponse(images=b64images, parameters=vars(txt2imgreq), info=processed.js())
++        return models.TextToImageResponse(
++            images=b64images,
++            parameters=vars(txt2imgreq),
++            info=processed.js(),
++            video=encode_processed_video_for_api(processed, send_images),
++        )
+ 
+     def img2imgapi(self, img2imgreq: models.StableDiffusionImg2ImgProcessingAPI):
+         task_id = img2imgreq.force_task_id or create_task_id("img2img")
+@@ -573,7 +589,12 @@ class Api:
+             img2imgreq.init_images = None
+             img2imgreq.mask = None
+ 
+-        return models.ImageToImageResponse(images=b64images, parameters=vars(img2imgreq), info=processed.js())
++        return models.ImageToImageResponse(
++            images=b64images,
++            parameters=vars(img2imgreq),
++            info=processed.js(),
++            video=encode_processed_video_for_api(processed, send_images),
++        )
+ 
+     def extras_single_image_api(self, req: models.ExtrasSingleImageRequest):
+         reqDict = setUpscalers(req)
+diff --git a/modules/api/models.py b/modules/api/models.py
+index 16421b8..2222a78 100644
+--- a/modules/api/models.py
++++ b/modules/api/models.py
+@@ -120,12 +120,22 @@ class TextToImageResponse(BaseModel):
+     images: list[str] | None = Field(default=None, title="Image", description="The generated image in base64 format.")
+     parameters: dict
+     info: str
++    video: str | None = Field(
++        default=None,
++        title="Video",
++        description="When the job outputs a video file (e.g. WAN), base64-encoded container bytes (MP4/MKV per settings). Null for image-only jobs.",
++    )
+ 
+ 
+ class ImageToImageResponse(BaseModel):
+     images: list[str] | None = Field(default=None, title="Image", description="The generated image in base64 format.")
+     parameters: dict
+     info: str
++    video: str | None = Field(
++        default=None,
++        title="Video",
++        description="When the job outputs a video file (e.g. WAN), base64-encoded container bytes (MP4/MKV per settings). Null for image-only jobs.",
++    )
+ 
+ 
+ class ExtrasBaseRequest(BaseModel):

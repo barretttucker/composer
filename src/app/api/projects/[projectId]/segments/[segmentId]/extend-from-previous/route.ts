@@ -31,7 +31,11 @@ export async function POST(_req: Request, context: Params) {
   }
 
   unlinkCustomSegmentInit(projectId, segmentId);
-  updateSegment(projectId, segmentId, { extend_from_previous: true });
+  updateSegment(projectId, segmentId, {
+    extend_from_previous: true,
+    seed_frame_source: "chained",
+    seed_frame_rel: undefined,
+  });
   const refreshed = loadProject(projectId);
   return NextResponse.json({ ok: true, project: refreshed });
 }

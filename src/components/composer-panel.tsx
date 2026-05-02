@@ -1,8 +1,8 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 import { AppShell } from "@/components/app-shell";
 import { ActiveProfileSubtitle } from "@/components/active-profile-subtitle";
@@ -27,6 +27,13 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 import { Separator } from "@/components/ui/separator";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import {
   Sheet,
   SheetContent,
   SheetDescription,
@@ -38,6 +45,7 @@ import {
   ForgeCatalogPayload,
   ProjectSetupPanel,
 } from "@/components/project-setup-panel";
+import { SegmentStructuredPromptFields } from "@/components/segment-structured-prompt-fields";
 import { SegmentSceneStrip } from "@/components/segment-scene-strip";
 import {
   formatForgeEtaSeconds,
@@ -218,7 +226,14 @@ export function ComposerPanel({ projectId }: { projectId: string }) {
       if (!res.ok) throw new Error("Delete failed");
       return res.json() as Promise<{ project: Project }>;
     },
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["project", projectId] }),
+    onSuccess: (data, segmentId) => {
+      setDraft(structuredClone(data.project));
+      setSelectedSegmentId((sid) => {
+        if (sid !== segmentId) return sid;
+        return data.project.segments[0]?.id ?? null;
+      });
+      void qc.invalidateQueries({ queryKey: ["project", projectId] });
+    },
   });
 
   const clipImageMutation = useMutation({
@@ -666,6 +681,9 @@ export function ComposerPanel({ projectId }: { projectId: string }) {
         <div>
           <h1 className="text-2xl font-semibold">{draft.name}</h1>
           <div className="text-muted-foreground flex gap-3 text-sm">
+            <Link href={`/project/${projectId}/continuity`} className="hover:underline">
+              Continuity
+            </Link>
             <Link href={`/project/${projectId}/runs`} className="hover:underline">
               Snapshots
             </Link>
@@ -706,50 +724,68 @@ export function ComposerPanel({ projectId }: { projectId: string }) {
           >
             Export script JSON
           </Button>
+          <Button
+            variant="outline"
+            onClick={async () => {
+              const res = await fetch(
+                `/api/projects/${projectId}/export?format=structured`,
+              );
+              const json = await res.json();
+              if (!res.ok) {
+                window.alert(
+                  typeof json?.error === "string"
+                    ? json.error
+                    : "Structured export failed",
+                );
+                return;
+              }
+              const blob = new Blob([JSON.stringify(json, null, 2)], {
+                type: "application/json",
+              });
+              const a = document.createElement("a");
+              a.href = URL.createObjectURL(blob);
+              a.download = `${draft.name.replace(/\s+/g, "_")}_structured.json`;
+              a.click();
+              URL.revokeObjectURL(a.href);
+            }}
+          >
+            Export structured JSON
+          </Button>
         </div>
       </div>
 
-      <Sheet open={projectSetupOpen} onOpenChange={setProjectSetupOpen}>
-        <SheetContent
-          side="left"
-          showCloseButton
-          className={cn(
-            "flex max-h-[100dvh] w-[min(100vw,42rem)] flex-col gap-0 overflow-hidden border-r bg-background p-0",
-            "sm:max-w-[min(42rem,calc(100vw-2rem))]",
-          )}
-        >
-          <SheetHeader className="shrink-0 border-b px-4 pt-14 pb-4 sm:px-6">
-            <SheetTitle>Project setup</SheetTitle>
-            <SheetDescription>
-              WAN sizing, Forge defaults, chaining, and remembered presets. Leave this closed while working
-              on prompts and runs.
-            </SheetDescription>
-          </SheetHeader>
-          <ScrollArea className="min-h-0 flex-1 overflow-hidden">
-            <div className="flex flex-col gap-4 px-4 py-4 sm:px-6">
-              <ProjectSetupPanel
-                draft={draft}
-                patchDraft={patchDraft}
-                res={res}
-                forgeCatalogQuery={forgeCatalogQuery}
-                refreshForgeCatalogMutation={refreshForgeCatalogMutation}
-                forgePickersReady={forgePickersReady}
-                checkpointItems={checkpointItems}
-                vaeItems={vaeItems}
-                textEncoderItems={textEncoderItems}
-                samplerItems={samplerItems}
-                schedulerItems={schedulerItems}
-                savedSetupSummary={savedSetupSummary}
-                hasSavedSetupDefaults={hasSavedSetupDefaults}
-                onSaveSetupDefaults={() => saveSetupDefaultsMutation.mutate()}
-                onApplySetupDefaults={() => applySetupDefaultsMutation.mutate()}
-                saveSetupDefaultsPending={saveSetupDefaultsMutation.isPending}
-                applySetupDefaultsPending={applySetupDefaultsMutation.isPending}
-              />
-            </div>
-          </ScrollArea>
-        </SheetContent>
-      </Sheet>
+      <Dialog open={projectSetupOpen} onOpenChange={setProjectSetupOpen}>
+        <DialogContent fullscreen showCloseButton>
+          <DialogHeader className="border-border shrink-0 border-b px-6 py-4 pr-14 pt-14 sm:px-10 sm:pb-5 sm:pt-16">
+            <DialogTitle className="text-lg sm:text-xl">Project setup</DialogTitle>
+            <DialogDescription>
+              Full-screen editor: tabs for canvas, continuity registries, and Forge defaults. Scroll the
+              page for long lists. Save the project when you are done.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="min-h-0 flex-1 overflow-y-auto overscroll-y-contain px-6 py-6 sm:px-10 sm:py-8">
+            <ProjectSetupPanel
+              draft={draft}
+              patchDraft={patchDraft}
+              res={res}
+              forgeCatalogQuery={forgeCatalogQuery}
+              refreshForgeCatalogMutation={refreshForgeCatalogMutation}
+              forgePickersReady={forgePickersReady}
+              checkpointItems={checkpointItems}
+              vaeItems={vaeItems}
+              textEncoderItems={textEncoderItems}
+              samplerItems={samplerItems}
+              schedulerItems={schedulerItems}
+              savedSetupSummary={savedSetupSummary}
+              hasSavedSetupDefaults={hasSavedSetupDefaults}
+              onSaveSetupDefaults={() => saveSetupDefaultsMutation.mutate()}
+              onApplySetupDefaults={() => applySetupDefaultsMutation.mutate()}
+              saveSetupDefaultsPending={saveSetupDefaultsMutation.isPending}
+              applySetupDefaultsPending={applySetupDefaultsMutation.isPending}
+            />
+          </div>
+        </DialogContent>
+      </Dialog>
 
       <input
         ref={clipFileInputRef}
@@ -795,6 +831,10 @@ export function ComposerPanel({ projectId }: { projectId: string }) {
               }
               extendBusy={extendFromPreviousMutation.isPending}
               uploadBusy={clipImageMutation.isPending}
+              onRemoveSegment={(segmentId) =>
+                deleteSegmentMutation.mutate(segmentId)
+              }
+              removeDisabled={deleteSegmentMutation.isPending}
             />
             <div className="flex justify-end">
               <Button
@@ -812,10 +852,20 @@ export function ComposerPanel({ projectId }: { projectId: string }) {
 
           {selectedSeg && selectedIndex >= 0 ? (
             <Card>
-              <CardHeader className="pb-3">
+              <CardHeader className="flex flex-row flex-wrap items-start justify-between gap-2 pb-3">
                 <CardTitle className="text-base">
-                  Clip {selectedIndex + 1} — prompt
+                  Clip {selectedIndex + 1} — prompts
                 </CardTitle>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  className="text-destructive border-destructive/40 shrink-0"
+                  disabled={deleteSegmentMutation.isPending}
+                  onClick={() => deleteSegmentMutation.mutate(selectedSeg.id)}
+                >
+                  Remove clip
+                </Button>
               </CardHeader>
               <CardContent className="space-y-3">
                 <div className="space-y-1">
@@ -858,7 +908,21 @@ export function ComposerPanel({ projectId }: { projectId: string }) {
                   </p>
                 </div>
 
-                <Textarea
+                <SegmentStructuredPromptFields
+                  draft={draft}
+                  selectedSeg={selectedSeg}
+                  selectedIndex={selectedIndex}
+                  patchDraft={patchDraft}
+                  projectId={projectId}
+                  onAfterSeedUpload={() => {
+                    setClipPreviewNonce((n) => n + 1);
+                    qc.invalidateQueries({ queryKey: ["project", projectId] });
+                  }}
+                />
+
+                <div className="space-y-1">
+                  <Label>Legacy flat prompt</Label>
+                  <Textarea
                   value={selectedSeg.prompt}
                   rows={5}
                   onChange={(e) =>
@@ -868,6 +932,7 @@ export function ComposerPanel({ projectId }: { projectId: string }) {
                       return p;
                     })}
                 />
+                </div>
 
                 <div className="flex flex-wrap items-center gap-4">
                   <label className="flex items-center gap-2 text-sm">
@@ -894,14 +959,6 @@ export function ComposerPanel({ projectId }: { projectId: string }) {
                     />
                     Pause for review
                   </label>
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    className="text-destructive ml-auto"
-                    onClick={() => deleteSegmentMutation.mutate(selectedSeg.id)}
-                  >
-                    Remove clip
-                  </Button>
                 </div>
               </CardContent>
             </Card>

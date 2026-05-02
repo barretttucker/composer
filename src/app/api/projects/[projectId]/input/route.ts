@@ -6,10 +6,13 @@ import { NextResponse } from "next/server";
 import { displayPixelDimensions } from "@/lib/image-display-dims";
 import {
   customSegmentInitAbsolute,
+  customSegmentInitRel,
   getResolution,
   inputsDir,
   loadProject,
+  projectRoot,
   saveProject,
+  touchedUpSeedRel,
   updateSegment,
 } from "@/lib/project-store";
 import { detectWanAspect, wanDimensionsFor } from "@/lib/wan-resolution";
@@ -105,10 +108,32 @@ export async function POST(req: Request, context: Params) {
     );
   }
 
+  const uploadKind = String(form.get("kind") ?? "clip_init");
+
+  if (uploadKind === "touched_seed") {
+    const rel = touchedUpSeedRel(seg.id);
+    const dest = path.join(projectRoot(projectId), ...rel.split("/"));
+    fs.mkdirSync(path.dirname(dest), { recursive: true });
+    fs.writeFileSync(dest, buf);
+    updateSegment(projectId, seg.id, {
+      seed_frame_source: "touched_up",
+      seed_frame_rel: rel,
+    });
+    return NextResponse.json({
+      ok: true,
+      path: rel,
+      segmentIndex,
+      image_width: iw,
+      image_height: ih,
+    });
+  }
+
   const dest = customSegmentInitAbsolute(projectId, seg.id);
   fs.writeFileSync(dest, buf);
   updateSegment(projectId, seg.id, {
     extend_from_previous: false,
+    seed_frame_source: "fresh",
+    seed_frame_rel: customSegmentInitRel(seg.id),
   });
 
   return NextResponse.json({

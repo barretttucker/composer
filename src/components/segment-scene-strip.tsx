@@ -6,7 +6,7 @@ import type { Segment } from "@/lib/schemas/project";
 import type { SegmentHealthFlags } from "@/lib/segment-render-fingerprint";
 import { segmentUsesChainInit } from "@/lib/schemas/project";
 import { cn } from "@/lib/utils";
-import { ArrowDownFromLine, Clapperboard, Plus } from "lucide-react";
+import { ArrowDownFromLine, Clapperboard, Plus, Trash2 } from "lucide-react";
 
 type SegmentSceneStripProps = {
   projectId: string;
@@ -24,6 +24,9 @@ type SegmentSceneStripProps = {
   onRequestExtendFromPrevious: (segmentId: string) => void;
   extendBusy?: boolean;
   uploadBusy?: boolean;
+  /** Removes clip from server timeline (persisted immediately). */
+  onRemoveSegment?: (segmentId: string) => void;
+  removeDisabled?: boolean;
 };
 
 export function SegmentSceneStrip({
@@ -41,6 +44,8 @@ export function SegmentSceneStrip({
   onRequestExtendFromPrevious,
   extendBusy,
   uploadBusy,
+  onRemoveSegment,
+  removeDisabled,
 }: SegmentSceneStripProps) {
   const f = Math.max(1, Math.round(fps));
 
@@ -169,13 +174,32 @@ export function SegmentSceneStrip({
                   <span className="text-muted-foreground">{sec * f + 1} f</span>
                 </div>
                 <div className="border-border/60 border-t px-2 pb-1.5">
-                  <p className="text-muted-foreground text-[10px] leading-snug">
-                    {i === 0
-                      ? "First frame drives the timeline."
-                      : chain
-                        ? "Chains from prev last frame."
-                        : "Uses your uploaded frame."}
-                  </p>
+                  <div className="flex items-start justify-between gap-2">
+                    <p className="text-muted-foreground flex-1 text-[10px] leading-snug">
+                      {i === 0
+                        ? "First frame drives the timeline."
+                        : chain
+                          ? "Chains from prev last frame."
+                          : "Uses your uploaded frame."}
+                    </p>
+                    {onRemoveSegment ? (
+                      <Button
+                        type="button"
+                        size="icon"
+                        variant="ghost"
+                        className="text-destructive hover:text-destructive size-7 shrink-0"
+                        title="Remove this clip"
+                        aria-label={`Remove clip ${i + 1}`}
+                        disabled={removeDisabled}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          onRemoveSegment(seg.id);
+                        }}
+                      >
+                        <Trash2 className="size-3.5" aria-hidden />
+                      </Button>
+                    ) : null}
+                  </div>
                 </div>
               </div>
             );

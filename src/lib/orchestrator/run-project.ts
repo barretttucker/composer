@@ -4,11 +4,9 @@ import fs from "node:fs";
 import path from "node:path";
 
 import type { AppProfile } from "@/lib/app-config/profiles";
+import { normalizeForgeBaseUrl } from "@/lib/app-config/profiles";
 import {
-  createForgeClient,
-  DEFAULT_NEGATIVE_PROMPT,
   ForgeImg2ImgError,
-  mapParamsToForgeImg2Img,
 } from "@/lib/forge/client";
 import {
   writeForgeImg2imgRawLogFile,
@@ -22,10 +20,13 @@ import {
 import {
   loadProject,
   publishSegmentCanonicalArtifacts,
+  resolveSegmentInitImageAbs,
+  seedFrameRelUsedForSegment,
   startFramePath,
-  customSegmentInitAbsolute,
+  wireNextSegmentSeedAfterPublish,
 } from "@/lib/project-store";
-import { mergeGenerationParams, segmentUsesChainInit } from "@/lib/schemas/project";
+import { buildRegistryMaps, effectiveNegativePrompt, effectivePositivePrompt } from "@/lib/prompt-assembly/assemble";
+import { mergeGenerationParams } from "@/lib/schemas/project";
 import { isForgeRawHttpLogEnabled } from "@/lib/env";
 import {
   createRunSkeleton,
@@ -40,6 +41,7 @@ import {
   segmentRenderFingerprint,
 } from "@/lib/segment-render-fingerprint";
 import type { RunRecord, SegmentRunState } from "@/lib/schemas/run";
+import { createForgeNeoVideoBackend } from "@/lib/video-backend/forge-neo-backend";
 
 import { broadcast } from "@/lib/orchestrator/broadcast";
 import {
@@ -108,8 +110,7 @@ export async function executeProjectRun(params: {
   }
 
   const profile = params.profile;
-  const client = createForgeClient(profile);
-  const forgeBaseUrl = client.baseUrl;
+  const forgeBaseUrl = normalizeForgeBaseUrl(profile.forge.baseUrl);
 
   const fromIndex = Math.floor(params.options?.from_segment_index ?? 0);
   const seedDelta = params.options?.seed_delta ?? 0;
@@ -195,11 +196,11 @@ async function runLoop(args: {
     args;
   let project = loadProject(projectId);
   let rawImg2imgWriter: ((record: ForgeImg2imgRawLogRecord) => void) | undefined;
-  const client = createForgeClient(
+  const { client, backend } = createForgeNeoVideoBackend(
     profile,
     isForgeRawHttpLogEnabled()
       ? {
-          logRawImg2img: (record) => rawImg2imgWriter?.(record),
+          logRawImg2img: (rec) => rawImg2imgWriter?.(rec),
         }
       : undefined,
   );
@@ -298,13 +299,33 @@ async function runLoop(args: {
         last_frame_rel: lastFrameRel.replace(/\\/g, "/"),
       });
       saveRunRecord(projectId, record);
+      const mapsLocked = buildRegistryMaps(project);
+      const posLocked = effectivePositivePrompt(segment, project, mapsLocked);
+      const negLocked = effectiveNegativePrompt(segment, project);
+      const resolvedLocked = resolveSegmentInitImageAbs({
+        projectId,
+        project,
+        segmentIndex: i,
+        chainCurrentAbs: currentInputPath,
+      });
       publishSegmentCanonicalArtifacts({
         projectId,
         segmentId: segment.id,
         mp4SourceAbs: mp4Abs,
         lastFrameSourceAbs: lastFrameAbs,
         fingerprint: segmentRenderFingerprint(project, i),
+        published: {
+          assembled_prompt: posLocked,
+          assembled_negative_prompt: negLocked,
+          merged_generation_params: merged,
+          seed_frame_rel_used: seedFrameRelUsedForSegment(project, i, resolvedLocked),
+        },
       });
+      wireNextSegmentSeedAfterPublish(
+        projectId,
+        i,
+        path.posix.join("segment_outputs", segment.id, "last_frame.png"),
+      );
       project = loadProject(projectId);
       broadcast(projectId, runId, {
         type: "segment_finished",
@@ -333,26 +354,29 @@ async function runLoop(args: {
     let lastForgePayload: Record<string, unknown> | undefined;
     try {
       rawImg2imgWriter = isForgeRawHttpLogEnabled()
-        ? (record) =>
-            writeForgeImg2imgRawLogFile(baseFolder, i, segment.id, record)
+        ? (rec) =>
+            writeForgeImg2imgRawLogFile(baseFolder, i, segment.id, rec)
         : undefined;
 
-      if (i > 0 && !segmentUsesChainInit(segment, i)) {
-        const customAbs = customSegmentInitAbsolute(projectId, segment.id);
-        if (fs.existsSync(customAbs)) {
-          currentInputPath = customAbs;
-        }
-      }
+      const maps = buildRegistryMaps(project);
+      const positivePrompt = effectivePositivePrompt(segment, project, maps);
+      const negativePrompt = effectiveNegativePrompt(segment, project);
+      record.prompt_snapshot = record.prompt_snapshot ?? {};
+      record.prompt_snapshot[segment.id] = {
+        positive: positivePrompt,
+        negative: negativePrompt,
+      };
+      record.updated_at = new Date().toISOString();
+      saveRunRecord(projectId, record);
 
-      const initB64 = fs.readFileSync(currentInputPath).toString("base64");
-
-      const { payload, seedUsed } = mapParamsToForgeImg2Img({
-        generation: merged,
-        initImageBase64: initB64,
-        prompt: segment.prompt,
-        negativePrompt: segment.negative_prompt ?? DEFAULT_NEGATIVE_PROMPT,
+      const resolvedInit = resolveSegmentInitImageAbs({
+        projectId,
+        project,
+        segmentIndex: i,
+        chainCurrentAbs: currentInputPath,
       });
-      lastForgePayload = payload;
+      const initB64 = fs.readFileSync(resolvedInit).toString("base64");
+      const seedRelUsed = seedFrameRelUsedForSegment(project, i, resolvedInit);
 
       let lastProgressSig = "";
       let lastProgressBroadcastAt = 0;
@@ -376,11 +400,22 @@ async function runLoop(args: {
       }, 1000);
 
       let videoBase64: string;
+      let payload: Record<string, unknown>;
+      let seedUsed: number;
       try {
-        videoBase64 = (await client.img2img(payload)).videoBase64;
+        const result = await backend.generate({
+          generation: merged,
+          initImageBase64: initB64,
+          prompt: positivePrompt,
+          negativePrompt: negativePrompt,
+        });
+        payload = result.requestPayload;
+        seedUsed = result.seedUsed;
+        videoBase64 = result.videoBase64;
       } finally {
         clearInterval(progressTimer);
       }
+      lastForgePayload = payload;
 
       await fs.promises.mkdir(path.dirname(mp4Abs), { recursive: true });
       await fs.promises.writeFile(
@@ -409,7 +444,18 @@ async function runLoop(args: {
         mp4SourceAbs: mp4Abs,
         lastFrameSourceAbs: lastFrameAbs,
         fingerprint: segmentRenderFingerprint(project, i),
+        published: {
+          assembled_prompt: positivePrompt,
+          assembled_negative_prompt: negativePrompt,
+          merged_generation_params: merged,
+          seed_frame_rel_used: seedRelUsed,
+        },
       });
+      wireNextSegmentSeedAfterPublish(
+        projectId,
+        i,
+        path.posix.join("segment_outputs", segment.id, "last_frame.png"),
+      );
       project = loadProject(projectId);
 
       broadcast(projectId, runId, {

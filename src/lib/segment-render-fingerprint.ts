@@ -3,6 +3,11 @@ import "server-only";
 import crypto from "node:crypto";
 
 import {
+  buildRegistryMaps,
+  effectiveNegativePrompt,
+  effectivePositivePrompt,
+} from "@/lib/prompt-assembly/assemble";
+import {
   mergeGenerationParams,
   segmentUsesChainInit,
   type Project,
@@ -41,9 +46,12 @@ export function segmentRenderFingerprint(
   const chain = segmentUsesChainInit(segment, segmentIndex);
   const dur =
     segment.duration_seconds ?? project.defaults.clip_duration_seconds;
+  const maps = buildRegistryMaps(project);
+  const prompt = effectivePositivePrompt(segment, project, maps);
+  const neg = effectiveNegativePrompt(segment, project);
   const payload = [
-    segment.prompt,
-    segment.negative_prompt ?? "",
+    prompt,
+    neg,
     chain ? "1" : "0",
     String(dur),
     JSON.stringify(merged),

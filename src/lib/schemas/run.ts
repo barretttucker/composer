@@ -44,6 +44,16 @@ export const runRecordSchema = z.object({
     .optional(),
   segment_states: z.array(segmentRunStateSchema),
   params_snapshot: z.record(z.string(), generationParamsSchema).optional(),
+  /** Last prompts attempted per segment in this run (mutable within the run). */
+  prompt_snapshot: z
+    .record(
+      z.string(),
+      z.object({
+        positive: z.string(),
+        negative: z.string(),
+      }),
+    )
+    .optional(),
   final_mp4_rel: z.string().optional(),
 });
 

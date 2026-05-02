@@ -20,6 +20,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import type { ForgeCatalog } from "@/lib/forge/types";
 import { vaeDisplayLabel, vaeOptionValue } from "@/lib/forge/types";
 import { suggestWanCheckpointPair } from "@/lib/forge/wan-pair";
@@ -27,6 +28,7 @@ import {
   WAN_DEFAULT_TEXT_ENCODER_FILENAME,
   WAN_DEFAULT_VAE_FILENAME,
 } from "@/lib/wan-forge-modules";
+import { PromptRegistryPanel } from "@/components/prompt-registry-panel";
 import {
   applyAutoDimensions,
   effectiveResolution,
@@ -92,7 +94,23 @@ export function ProjectSetupPanel({
   const fpsRounded = Math.max(1, Math.round(chaining.fps));
 
   return (
-    <>
+    <Tabs defaultValue="canvas" className="flex flex-col gap-0">
+      <TabsList
+        variant="line"
+        className="bg-background sticky top-0 z-10 mb-5 grid h-auto w-full grid-cols-3 gap-1 rounded-none border-0 border-b border-border p-0 pb-3 shadow-none"
+      >
+        <TabsTrigger value="canvas" className="flex-1 px-1.5 py-2 text-xs sm:px-2 sm:text-sm">
+          Canvas &amp; chain
+        </TabsTrigger>
+        <TabsTrigger value="continuity" className="flex-1 px-1.5 py-2 text-xs sm:px-2 sm:text-sm">
+          Continuity
+        </TabsTrigger>
+        <TabsTrigger value="forge" className="flex-1 px-1.5 py-2 text-xs sm:px-2 sm:text-sm">
+          Forge defaults
+        </TabsTrigger>
+      </TabsList>
+
+      <TabsContent value="canvas" className="mt-0 space-y-5 outline-none">
       <Card>
         <CardHeader className="pb-3">
           <CardTitle className="text-base">WAN 2.2 output size</CardTitle>
@@ -212,15 +230,66 @@ export function ProjectSetupPanel({
           )}
         </CardContent>
       </Card>
+
       <Card>
         <CardHeader className="pb-3">
-          <CardTitle className="text-base">Defaults</CardTitle>
+          <CardTitle className="text-base">Chaining</CardTitle>
           <CardDescription>
-            Applied to segments unless overridden.{" "}
-            <span className="font-medium">Save project + default template</span> writes this project
-            to disk and updates the template used when you create{" "}
-            <span className="font-medium">new projects</span> (alongside profiles in your Composer
-            data directory).
+            Frame offset: negative counts from end of clip (-1 = last frame). FPS ties clip length to
+            latent frame counts on the Forge defaults tab.
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-3">
+          <NumField
+            label="Frame offset"
+            value={chaining.frame_offset}
+            onChange={(v) =>
+              patchDraft((p) => {
+                p.chaining.frame_offset = v;
+                return p;
+              })}
+          />
+          <NumField
+            label="FPS"
+            value={chaining.fps}
+            onChange={(v) =>
+              patchDraft((p) => {
+                p.chaining.fps = v;
+                const f = Math.max(1, Math.round(v));
+                p.defaults.frames = framesForClipSeconds(p.defaults.clip_duration_seconds, f);
+                return p;
+              })}
+          />
+          <NumField
+            label="Blend frames (future)"
+            value={chaining.blend_frames}
+            onChange={(v) =>
+              patchDraft((p) => {
+                p.chaining.blend_frames = v;
+                return p;
+              })}
+          />
+        </CardContent>
+      </Card>
+
+      </TabsContent>
+
+      <TabsContent value="continuity" className="mt-0 space-y-5 outline-none">
+        <PromptRegistryPanel
+          draft={draft}
+          patchDraft={patchDraft}
+          defaultCollapsed={false}
+        />
+      </TabsContent>
+
+      <TabsContent value="forge" className="mt-0 space-y-5 outline-none">
+      <Card>
+        <CardHeader className="pb-3">
+          <CardTitle className="text-base">Generation defaults</CardTitle>
+          <CardDescription className="text-xs leading-relaxed">
+            Applied per clip unless overridden.{" "}
+            <span className="font-medium">Save project + default template</span> stores these for new
+            projects.
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-3">
@@ -549,47 +618,8 @@ export function ProjectSetupPanel({
           </div>
         </CardContent>
       </Card>
-
-      <Card>
-        <CardHeader className="pb-3">
-          <CardTitle className="text-base">Chaining</CardTitle>
-          <CardDescription>
-            Frame offset: negative counts from end of clip (-1 = last frame).
-          </CardDescription>
-        </CardHeader>
-        <CardContent className="space-y-3">
-          <NumField
-            label="Frame offset"
-            value={chaining.frame_offset}
-            onChange={(v) =>
-              patchDraft((p) => {
-                p.chaining.frame_offset = v;
-                return p;
-              })}
-          />
-          <NumField
-            label="FPS"
-            value={chaining.fps}
-            onChange={(v) =>
-              patchDraft((p) => {
-                p.chaining.fps = v;
-                const f = Math.max(1, Math.round(v));
-                p.defaults.frames = framesForClipSeconds(p.defaults.clip_duration_seconds, f);
-                return p;
-              })}
-          />
-          <NumField
-            label="Blend frames (future)"
-            value={chaining.blend_frames}
-            onChange={(v) =>
-              patchDraft((p) => {
-                p.chaining.blend_frames = v;
-                return p;
-              })}
-          />
-        </CardContent>
-      </Card>
-    </>
+      </TabsContent>
+    </Tabs>
   );
 }
 

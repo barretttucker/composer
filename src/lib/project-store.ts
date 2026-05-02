@@ -16,12 +16,16 @@ import {
   mergeGenerationParams,
   portableScriptSchema,
   projectSchema,
+  STRUCTURED_EXPORT_KIND,
+  structuredProjectExportSchema,
   WAN_COMPOSER_VERSION,
   DEFAULT_GENERATION_SEED,
+  type GenerationParams,
   type PortableScript,
   type Project,
   type ResolutionSettings,
   type Segment,
+  type StructuredProjectExport,
 } from "@/lib/schemas/project";
 import { applySetupDefaultsTemplate } from "@/lib/app-config/project-setup-defaults";
 import { migrateClipDurationFields } from "@/lib/clip-defaults-migrate";
@@ -35,6 +39,125 @@ import {
   framesForClipSeconds,
   inferClipSecondsFromFrames,
 } from "@/lib/video-time";
+
+function migrateStructuredProjectRaw(raw: Record<string, unknown>): void {
+  if (!Array.isArray(raw.characters)) raw.characters = [];
+  if (!Array.isArray(raw.locations)) raw.locations = [];
+  if (!Array.isArray(raw.style_blocks)) raw.style_blocks = [];
+  if (!Array.isArray(raw.character_ids)) raw.character_ids = [];
+  if (!Array.isArray(raw.location_ids)) raw.location_ids = [];
+  if (!Array.isArray(raw.style_block_ids)) raw.style_block_ids = [];
+  const segments = raw.segments;
+  if (!Array.isArray(segments)) return;
+  for (const item of segments) {
+    if (!item || typeof item !== "object") continue;
+    const seg = item as Record<string, unknown>;
+    if (typeof seg.prompt !== "string") seg.prompt = "";
+    if (seg.seed_frame_source == null) {
+      const idx = typeof seg.index === "number" ? seg.index : 0;
+      if (idx > 0 && seg.extend_from_previous === false) {
+        seg.seed_frame_source = "fresh";
+      } else {
+        seg.seed_frame_source = "chained";
+      }
+    }
+  }
+}
+
+/** Project-relative POSIX path for the init image actually used (for bookkeeping / UI). */
+export function seedFrameRelUsedForSegment(
+  project: Project,
+  segmentIndex: number,
+  resolvedInitAbs: string,
+): string {
+  const root = projectRoot(project.id);
+  const rel = path.relative(root, resolvedInitAbs).replace(/\\/g, "/");
+  if (rel.startsWith("..")) {
+    return path.posix.join("inputs", "start_frame.png");
+  }
+  return rel;
+}
+
+/**
+ * Resolve absolute path to the PNG Forge should use as init for this segment.
+ * `chainCurrentAbs` is the previous clip last-frame path when chaining (may be stale until prior renders).
+ */
+export function resolveSegmentInitImageAbs(params: {
+  projectId: string;
+  project: Project;
+  segmentIndex: number;
+  chainCurrentAbs: string;
+}): string {
+  const { projectId, project, segmentIndex, chainCurrentAbs } = params;
+  const root = projectRoot(projectId);
+  const seg = project.segments[segmentIndex];
+  if (segmentIndex === 0) {
+    return startFramePath(projectId);
+  }
+
+  const relToAbs = (rel: string) => path.join(root, rel.replace(/\//g, path.sep));
+
+  const src = seg.seed_frame_source;
+  const legacyFresh = seg.extend_from_previous === false && (src == null || src === "fresh");
+
+  if (src === "fresh" || legacyFresh) {
+    if (seg.seed_frame_rel != null && String(seg.seed_frame_rel).trim() !== "") {
+      const abs = relToAbs(String(seg.seed_frame_rel));
+      if (fs.existsSync(abs)) return abs;
+    }
+    const custom = customSegmentInitAbsolute(projectId, seg.id);
+    if (fs.existsSync(custom)) return custom;
+    return startFramePath(projectId);
+  }
+
+  if (src === "touched_up") {
+    if (seg.seed_frame_rel != null && String(seg.seed_frame_rel).trim() !== "") {
+      const abs = relToAbs(String(seg.seed_frame_rel));
+      if (fs.existsSync(abs)) return abs;
+    }
+    return chainCurrentAbs;
+  }
+
+  if (seg.seed_frame_rel != null && String(seg.seed_frame_rel).trim() !== "") {
+    const abs = relToAbs(String(seg.seed_frame_rel));
+    if (fs.existsSync(abs)) return abs;
+  }
+
+  return chainCurrentAbs;
+}
+
+export function wireNextSegmentSeedAfterPublish(
+  projectId: string,
+  completedSegmentIndex: number,
+  completedLastFrameRelPosix: string,
+): void {
+  const p = loadProject(projectId);
+  if (completedSegmentIndex >= p.segments.length - 1) return;
+  const next = p.segments[completedSegmentIndex + 1];
+  if (next.seed_frame_source === "fresh") return;
+
+  if (next.seed_frame_source === "touched_up") {
+    if (next.seed_frame_rel == null || String(next.seed_frame_rel).trim() === "") {
+      const rel = touchedUpSeedRel(next.id);
+      const src = path.join(projectRoot(projectId), ...completedLastFrameRelPosix.split("/"));
+      const dest = path.join(projectRoot(projectId), ...rel.split("/"));
+      ensureDir(path.dirname(dest));
+      if (fs.existsSync(src)) fs.copyFileSync(src, dest);
+      next.seed_frame_rel = rel;
+      p.updated_at = new Date().toISOString();
+      saveProject(p);
+    }
+    return;
+  }
+
+  if (next.seed_frame_source === "chained" || next.seed_frame_source == null) {
+    if (!next.seed_frame_rel || String(next.seed_frame_rel).trim() === "") {
+      next.seed_frame_rel = completedLastFrameRelPosix.replace(/\\/g, "/");
+      p.updated_at = new Date().toISOString();
+      saveProject(p);
+    }
+  }
+}
 
 export function projectRoot(projectId: string): string {
   return path.join(getProjectsRoot(), projectId);
@@ -88,12 +211,22 @@ export function readCanonicalSegmentArtifacts(
   return null;
 }
 
+export function canonicalSegmentGenerationJsonRel(segmentId: string): string {
+  return path.posix.join("segment_outputs", segmentId, "generation.json");
+}
+
 export function publishSegmentCanonicalArtifacts(params: {
   projectId: string;
   segmentId: string;
   mp4SourceAbs: string;
   lastFrameSourceAbs: string;
   fingerprint: string;
+  published?: {
+    assembled_prompt: string;
+    assembled_negative_prompt: string;
+    merged_generation_params: GenerationParams;
+    seed_frame_rel_used: string;
+  };
 }): void {
   const dir = segmentArtifactsDir(params.projectId, params.segmentId);
   ensureDir(dir);
@@ -105,16 +238,50 @@ export function publishSegmentCanonicalArtifacts(params: {
     params.lastFrameSourceAbs,
     canonicalSegmentLastFrame(params.projectId, params.segmentId),
   );
+  const clipRel = path.posix.join("segment_outputs", params.segmentId, "clip.mp4");
+  const lfRel = path.posix.join("segment_outputs", params.segmentId, "last_frame.png");
+  const now = new Date().toISOString();
+  if (params.published) {
+    const sidecar = {
+      assembled_prompt: params.published.assembled_prompt,
+      assembled_negative_prompt: params.published.assembled_negative_prompt,
+      merged_generation_params: params.published.merged_generation_params,
+      seed_frame_rel_used: params.published.seed_frame_rel_used.replace(/\\/g, "/"),
+      output_clip_rel: clipRel,
+      output_last_frame_rel: lfRel,
+      published_at: now,
+    };
+    fs.writeFileSync(
+      path.join(dir, "generation.json"),
+      JSON.stringify(sidecar, null, 2),
+      "utf8",
+    );
+  }
   const p = loadProject(params.projectId);
   const seg = p.segments.find((s) => s.id === params.segmentId);
   if (!seg) return;
   seg.last_built_fingerprint = params.fingerprint;
+  if (params.published) {
+    seg.published_generation = {
+      assembled_prompt: params.published.assembled_prompt,
+      assembled_negative_prompt: params.published.assembled_negative_prompt,
+      merged_generation_params: params.published.merged_generation_params,
+      published_at: now,
+      seed_frame_rel_used: params.published.seed_frame_rel_used.replace(/\\/g, "/"),
+      output_clip_rel: clipRel,
+      output_last_frame_rel: lfRel,
+    };
+  }
   saveProject(p);
 }
 
 export function removeSegmentArtifactsDir(projectId: string, segmentId: string): void {
   const dir = segmentArtifactsDir(projectId, segmentId);
   if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true });
+}
+
+export function touchedUpSeedRel(segmentId: string): string {
+  return path.posix.join("inputs", `seed-touched-${segmentId}.png`);
 }
 
 export function customSegmentInitRel(segmentId: string): string {
@@ -138,8 +305,8 @@ export function defaultGenerationParams(): Project["defaults"] {
     text_encoder: WAN_DEFAULT_TEXT_ENCODER_FILENAME,
     width: 832,
     height: 480,
-    clip_duration_seconds: 3,
-    frames: framesForClipSeconds(3, 16),
+    clip_duration_seconds: 5,
+    frames: framesForClipSeconds(5, 16),
     steps: 4,
     cfg_scale: 1,
     shift: 8,
@@ -181,6 +348,7 @@ export function loadProject(projectId: string): Project {
       detected_aspect: null,
     };
   }
+  migrateStructuredProjectRaw(raw);
   migrateClipDurationFields(raw);
   return projectSchema.parse(raw);
 }
@@ -227,6 +395,12 @@ export function createProject(name: string): Project {
       bucket: "480p",
       detected_aspect: null,
     },
+    characters: [],
+    locations: [],
+    style_blocks: [],
+    character_ids: [],
+    location_ids: [],
+    style_block_ids: [],
   };
   project = applySetupDefaultsTemplate(project);
   saveProject(project);
@@ -241,6 +415,7 @@ export function touchProjectUpdated(projectId: string): void {
 
 export function addSegment(projectId: string, prompt: string): Segment {
   const p = loadProject(projectId);
+  const prev = p.segments[p.segments.length - 1];
   const seg: Segment = {
     id: nanoid(),
     index: p.segments.length,
@@ -250,6 +425,11 @@ export function addSegment(projectId: string, prompt: string): Segment {
   };
   if (p.segments.length > 0) {
     seg.extend_from_previous = true;
+    seg.seed_frame_source = "chained";
+    const mo = prev?.motion_out?.trim() ?? "";
+    if (mo !== "") seg.motion_in = mo;
+  } else {
+    seg.seed_frame_source = "chained";
   }
   p.segments.push(seg);
   p.updated_at = new Date().toISOString();
@@ -275,6 +455,8 @@ export function updateSegment(
 export function removeSegment(projectId: string, segmentId: string): void {
   const p = loadProject(projectId);
   unlinkCustomSegmentInit(projectId, segmentId);
+  const touchedAbs = path.join(inputsDir(projectId), `seed-touched-${segmentId}.png`);
+  if (fs.existsSync(touchedAbs)) fs.unlinkSync(touchedAbs);
   removeSegmentArtifactsDir(projectId, segmentId);
   p.segments = p.segments.filter((s) => s.id !== segmentId);
   p.segments.forEach((s, i) => {
@@ -469,4 +651,65 @@ export function exportPortableScript(projectId: string): PortableScript {
       };
     }),
   });
+}
+
+export function exportStructuredProject(projectId: string): StructuredProjectExport {
+  const p = loadProject(projectId);
+  return structuredProjectExportSchema.parse({
+    export_kind: STRUCTURED_EXPORT_KIND,
+    wan_composer_version: WAN_COMPOSER_VERSION,
+    exported_at: new Date().toISOString(),
+    project: {
+      id: p.id,
+      name: p.name,
+      created_at: p.created_at,
+      updated_at: p.updated_at,
+      structured_prompts: p.structured_prompts,
+      characters: p.characters,
+      locations: p.locations,
+      style_blocks: p.style_blocks,
+      character_ids: p.character_ids,
+      location_ids: p.location_ids,
+      style_block_ids: p.style_block_ids,
+      default_style_block_id: p.default_style_block_id,
+      default_negative_prompt: p.default_negative_prompt,
+      defaults: p.defaults,
+      chaining: p.chaining,
+      resolution: getResolution(p),
+      segments: p.segments,
+    },
+  });
+}
+
+/**
+ * Restore project.json from structured export. Fails if project id already exists unless overwrite.
+ * Does not create or copy media files; paths in segments must exist on disk for full fidelity.
+ */
+export function importStructuredProject(
+  data: unknown,
+  options?: { overwrite?: boolean },
+): Project {
+  const parsed = structuredProjectExportSchema.parse(data);
+  const proj = parsed.project;
+  const projectId = proj.id;
+  const exists = fs.existsSync(projectJsonPath(projectId));
+  if (exists && !options?.overwrite) {
+    throw new Error(
+      `Project id ${projectId} already exists. Delete it first or import with overwrite.`,
+    );
+  }
+  const root = projectRoot(projectId);
+  ensureDir(root);
+  ensureDir(inputsDir(projectId));
+  ensureDir(runsDir(projectId));
+  ensureDir(segmentOutputsRoot(projectId));
+  const raw = {
+    ...proj,
+    updated_at: new Date().toISOString(),
+  };
+  migrateStructuredProjectRaw(raw as Record<string, unknown>);
+  migrateClipDurationFields(raw as Record<string, unknown>);
+  const full = projectSchema.parse(raw);
+  saveProject(full);
+  return full;
 }

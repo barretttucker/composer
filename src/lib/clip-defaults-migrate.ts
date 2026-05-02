@@ -17,7 +17,7 @@ export function migrateClipDurationFields(raw: Record<string, unknown>): void {
     const d = def as Record<string, unknown>;
     if (typeof d.clip_duration_seconds !== "number") {
       const frames =
-        typeof d.frames === "number" ? d.frames : framesForClipSeconds(3, fpsFromChaining);
+        typeof d.frames === "number" ? d.frames : framesForClipSeconds(5, fpsFromChaining);
       const sec = inferClipSecondsFromFrames(frames, fpsFromChaining);
       d.clip_duration_seconds = sec;
       d.frames = framesForClipSeconds(sec, fpsFromChaining);

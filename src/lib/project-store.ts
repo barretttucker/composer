@@ -12,8 +12,10 @@ import {
 } from "@/lib/env";
 import {
   chainingSchema,
+  DEFAULT_CHAIN_HYGIENE,
   generationParamsSchema,
   mergeGenerationParams,
+  MOTION_FIRST_ASSEMBLY_ORDER,
   portableScriptSchema,
   projectSchema,
   STRUCTURED_EXPORT_KIND,
@@ -29,6 +31,13 @@ import {
 } from "@/lib/schemas/project";
 import { applySetupDefaultsTemplate } from "@/lib/app-config/project-setup-defaults";
 import { migrateClipDurationFields } from "@/lib/clip-defaults-migrate";
+import { isValidAssemblyOrder } from "@/lib/prompt-assembly/assemble";
+import {
+  assertValidProjectFolderKey,
+  migrateProjectSlugRaw,
+  PROJECT_FOLDER_KEY_RE,
+  slugifyDisplayName,
+} from "@/lib/project-slug";
 import { displayPixelDimensions } from "@/lib/image-display-dims";
 import { detectWanAspect, wanDimensionsFor } from "@/lib/wan-resolution";
 import {
@@ -47,12 +56,21 @@ function migrateStructuredProjectRaw(raw: Record<string, unknown>): void {
   if (!Array.isArray(raw.character_ids)) raw.character_ids = [];
   if (!Array.isArray(raw.location_ids)) raw.location_ids = [];
   if (!Array.isArray(raw.style_block_ids)) raw.style_block_ids = [];
+  if (raw.assembly_config == null || typeof raw.assembly_config !== "object") {
+    raw.assembly_config = { order: [...MOTION_FIRST_ASSEMBLY_ORDER] };
+  } else {
+    const ac = raw.assembly_config as Record<string, unknown>;
+    if (!Array.isArray(ac.order) || !isValidAssemblyOrder(ac.order)) {
+      ac.order = [...MOTION_FIRST_ASSEMBLY_ORDER];
+    }
+  }
   const segments = raw.segments;
   if (!Array.isArray(segments)) return;
   for (const item of segments) {
     if (!item || typeof item !== "object") continue;
     const seg = item as Record<string, unknown>;
     if (typeof seg.prompt !== "string") seg.prompt = "";
+    if (seg.descriptor_mode == null) seg.descriptor_mode = "full";
     if (seg.seed_frame_source == null) {
       const idx = typeof seg.index === "number" ? seg.index : 0;
       if (idx > 0 && seg.extend_from_previous === false) {
@@ -165,6 +183,84 @@ export function projectRoot(projectId: string): string {
 
 export function projectJsonPath(projectId: string): string {
   return path.join(projectRoot(projectId), "project.json");
+}
+
+function slugOccupiedByDifferentProject(slug: string, stableProjectId: string): boolean {
+  const jp = projectJsonPath(slug);
+  if (!fs.existsSync(jp)) return false;
+  try {
+    const diskRaw = JSON.parse(fs.readFileSync(jp, "utf8")) as Record<string, unknown>;
+    migrateProjectSlugRaw(diskRaw);
+    const diskId = diskRaw.id;
+    return typeof diskId !== "string" || diskId !== stableProjectId;
+  } catch {
+    return true;
+  }
+}
+
+/**
+ * Folder segment under COMPOSER_PROJECTS_ROOT (and `/project/[…]` URL).
+ * `currentFolderKey` is set when renaming an existing project so the current folder stays reserved for this id.
+ */
+export function allocateFolderSlugForProject(
+  displayName: string,
+  stableProjectId: string,
+  currentFolderKey: string | null,
+): string {
+  const baseRaw = slugifyDisplayName(displayName);
+  const base =
+    baseRaw ||
+    `project_${stableProjectId.slice(0, Math.min(12, stableProjectId.length))}`;
+  let candidate = base;
+  let suffix = 2;
+  for (;;) {
+    if (currentFolderKey !== null && candidate === currentFolderKey) {
+      return candidate;
+    }
+    if (!slugOccupiedByDifferentProject(candidate, stableProjectId)) {
+      return candidate;
+    }
+    candidate = `${base}_${suffix}`;
+    suffix++;
+    if (suffix > 10_000) {
+      throw new Error("Could not allocate a unique project folder name");
+    }
+  }
+}
+
+function allocateFolderSlugForImport(
+  displayName: string,
+  stableProjectId: string,
+  exportedSlug: string | undefined | null,
+): string {
+  const trimmed =
+    typeof exportedSlug === "string" ? exportedSlug.trim() : "";
+  if (
+    trimmed &&
+    PROJECT_FOLDER_KEY_RE.test(trimmed) &&
+    !slugOccupiedByDifferentProject(trimmed, stableProjectId)
+  ) {
+    return trimmed;
+  }
+  return allocateFolderSlugForProject(displayName, stableProjectId, null);
+}
+
+export function renameProjectFolderIfNeeded(
+  previousFolderKey: string,
+  nextFolderKey: string,
+): void {
+  if (previousFolderKey === nextFolderKey) return;
+  assertValidProjectFolderKey(previousFolderKey);
+  assertValidProjectFolderKey(nextFolderKey);
+  const from = projectRoot(previousFolderKey);
+  const to = projectRoot(nextFolderKey);
+  if (!fs.existsSync(from)) {
+    throw new Error(`Cannot rename missing project folder: ${previousFolderKey}`);
+  }
+  if (fs.existsSync(to)) {
+    throw new Error(`Project folder already exists: ${nextFolderKey}`);
+  }
+  fs.renameSync(from, to);
 }
 
 export function presetsPath(projectId: string): string {
@@ -315,6 +411,7 @@ export function defaultGenerationParams(): Project["defaults"] {
     sampler: "Euler",
     scheduler: "Simple",
     seed: DEFAULT_GENERATION_SEED,
+    chain_hygiene: { ...DEFAULT_CHAIN_HYGIENE },
   });
 }
 
@@ -336,8 +433,9 @@ export function listProjectIds(): string[] {
     .sort();
 }
 
-export function loadProject(projectId: string): Project {
-  const raw = JSON.parse(fs.readFileSync(projectJsonPath(projectId), "utf8")) as Record<
+export function loadProject(folderKey: string): Project {
+  assertValidProjectFolderKey(folderKey);
+  const raw = JSON.parse(fs.readFileSync(projectJsonPath(folderKey), "utf8")) as Record<
     string,
     unknown
   >;
@@ -350,7 +448,14 @@ export function loadProject(projectId: string): Project {
   }
   migrateStructuredProjectRaw(raw);
   migrateClipDurationFields(raw);
-  return projectSchema.parse(raw);
+  migrateProjectSlugRaw(raw);
+  const parsed = projectSchema.parse(raw);
+  if (parsed.slug !== folderKey) {
+    throw new Error(
+      `Project folder "${folderKey}" does not match slug "${parsed.slug}" in project.json.`,
+    );
+  }
+  return parsed;
 }
 
 export function getResolution(project: Project): ResolutionSettings {
@@ -365,8 +470,9 @@ export function getResolution(project: Project): ResolutionSettings {
 
 export function saveProject(project: Project): void {
   const parsed = projectSchema.parse(project);
+  ensureDir(projectRoot(parsed.slug));
   fs.writeFileSync(
-    projectJsonPath(parsed.id),
+    projectJsonPath(parsed.slug),
     JSON.stringify(parsed, null, 2),
     "utf8",
   );
@@ -375,15 +481,17 @@ export function saveProject(project: Project): void {
 export function createProject(name: string): Project {
   ensureDir(getProjectsRoot());
   const id = nanoid();
+  const slug = allocateFolderSlugForProject(name, id, null);
   const now = new Date().toISOString();
-  const root = projectRoot(id);
+  const root = projectRoot(slug);
   ensureDir(root);
-  ensureDir(inputsDir(id));
-  ensureDir(runsDir(id));
-  ensureDir(segmentOutputsRoot(id));
+  ensureDir(inputsDir(slug));
+  ensureDir(runsDir(slug));
+  ensureDir(segmentOutputsRoot(slug));
 
   let project: Project = {
     id,
+    slug,
     name,
     created_at: now,
     updated_at: now,
@@ -422,6 +530,7 @@ export function addSegment(projectId: string, prompt: string): Segment {
     prompt,
     pause_for_review: false,
     locked: false,
+    descriptor_mode: "full",
   };
   if (p.segments.length > 0) {
     seg.extend_from_previous = true;
@@ -521,7 +630,7 @@ export function importPortableScript(
   const detectedAspect = detectWanAspect(iw, ih);
 
   const project = createProject(parsed.name);
-  const pngPath = startFramePath(project.id);
+  const pngPath = startFramePath(project.slug);
   fs.writeFileSync(pngPath, imageBuffer);
 
   const chaining = defaultChaining();
@@ -553,6 +662,7 @@ export function importPortableScript(
       params_override,
       pause_for_review: s.pause_for_review ?? false,
       locked: s.locked ?? false,
+      descriptor_mode: "full",
     };
     if (duration_seconds !== undefined) seg.duration_seconds = duration_seconds;
     if (index > 0 && s.extend_from_previous !== undefined) {
@@ -661,6 +771,7 @@ export function exportStructuredProject(projectId: string): StructuredProjectExp
     exported_at: new Date().toISOString(),
     project: {
       id: p.id,
+      slug: p.slug,
       name: p.name,
       created_at: p.created_at,
       updated_at: p.updated_at,
@@ -673,6 +784,8 @@ export function exportStructuredProject(projectId: string): StructuredProjectExp
       style_block_ids: p.style_block_ids,
       default_style_block_id: p.default_style_block_id,
       default_negative_prompt: p.default_negative_prompt,
+      assembly_config: p.assembly_config,
+      field_budgets: p.field_budgets,
       defaults: p.defaults,
       chaining: p.chaining,
       resolution: getResolution(p),
@@ -691,24 +804,30 @@ export function importStructuredProject(
 ): Project {
   const parsed = structuredProjectExportSchema.parse(data);
   const proj = parsed.project;
-  const projectId = proj.id;
-  const exists = fs.existsSync(projectJsonPath(projectId));
+  const stableId = proj.id;
+  const slug = allocateFolderSlugForImport(proj.name, stableId, proj.slug ?? null);
+
+  const exists = fs.existsSync(projectJsonPath(slug));
   if (exists && !options?.overwrite) {
     throw new Error(
-      `Project id ${projectId} already exists. Delete it first or import with overwrite.`,
+      `Project folder "${slug}" already exists. Delete it first or import with overwrite.`,
     );
   }
-  const root = projectRoot(projectId);
+
+  const root = projectRoot(slug);
   ensureDir(root);
-  ensureDir(inputsDir(projectId));
-  ensureDir(runsDir(projectId));
-  ensureDir(segmentOutputsRoot(projectId));
+  ensureDir(inputsDir(slug));
+  ensureDir(runsDir(slug));
+  ensureDir(segmentOutputsRoot(slug));
+
   const raw = {
     ...proj,
+    slug,
     updated_at: new Date().toISOString(),
   };
   migrateStructuredProjectRaw(raw as Record<string, unknown>);
   migrateClipDurationFields(raw as Record<string, unknown>);
+  migrateProjectSlugRaw(raw as Record<string, unknown>);
   const full = projectSchema.parse(raw);
   saveProject(full);
   return full;

@@ -1,7 +1,8 @@
 "use client";
 
-import { useMemo, useRef } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
+import { AssemblyOrderEditor, ASSEMBLY_FIELD_LABELS } from "@/components/assembly-order-editor";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -18,9 +19,63 @@ import {
   buildRegistryMaps,
   effectivePositivePrompt,
   FORGE_DEFAULT_NEGATIVE_PROMPT,
+  isValidAssemblyOrder,
+  projectAssemblyOrder,
+  resolveAssemblyOrder,
 } from "@/lib/prompt-assembly/assemble";
-import type { Project, Segment, SegmentActiveCharacter } from "@/lib/schemas/project";
-import { segmentUsesStructuredAssembly } from "@/lib/schemas/project";
+import {
+  estimatedTokensFromWords,
+  FIELD_BUDGET_TOOLTIPS,
+  fieldTooltipForSeverity,
+  mergeFieldBudgets,
+  severityForFieldCount,
+  severityForTotalWordCount,
+  totalTooltipForSeverity,
+  wordCount,
+} from "@/lib/prompt-assembly/budgets";
+import type { Project, Segment, SegmentActiveCharacter, SpatialPosition } from "@/lib/schemas/project";
+import {
+  MOTION_FIRST_ASSEMBLY_ORDER,
+  segmentUsesStructuredAssembly,
+} from "@/lib/schemas/project";
+import { cn } from "@/lib/utils";
+
+type BudgetSeverity = ReturnType<typeof severityForFieldCount>;
+
+function useDebouncedWordCount(text: string, ms = 200): number {
+  const [n, setN] = useState(() => wordCount(text));
+  useEffect(() => {
+    const t = setTimeout(() => setN(wordCount(text)), ms);
+    return () => clearTimeout(t);
+  }, [text, ms]);
+  return n;
+}
+
+function counterClass(sev: BudgetSeverity): string {
+  switch (sev) {
+    case "soft":
+      return "text-amber-700";
+    case "hard":
+      return "text-orange-700";
+    case "capped":
+      return "text-red-700";
+    default:
+      return "text-muted-foreground";
+  }
+}
+
+function fieldRingClass(sev: BudgetSeverity): string {
+  switch (sev) {
+    case "soft":
+      return "ring-1 ring-amber-200";
+    case "hard":
+      return "ring-1 ring-orange-300";
+    case "capped":
+      return "ring-1 ring-red-300";
+    default:
+      return "";
+  }
+}
 
 export const CAMERA_PRESETS = [
   "slow dolly forward",
@@ -42,6 +97,7 @@ export function SegmentStructuredPromptFields({
   patchDraft,
   projectId,
   onAfterSeedUpload,
+  onAssemblyAbCompare,
 }: {
   draft: Project;
   selectedSeg: Segment;
@@ -49,6 +105,8 @@ export function SegmentStructuredPromptFields({
   patchDraft: (u: (p: Project) => Project) => void;
   projectId: string;
   onAfterSeedUpload: () => void;
+  /** Render this single clip with motion-first vs character-first A/B (orchestrator validates scope). */
+  onAssemblyAbCompare?: () => void;
 }) {
   const maps = useMemo(() => buildRegistryMaps(draft), [draft]);
   const locationIdsForPicker = useMemo(() => {
@@ -71,9 +129,26 @@ export function SegmentStructuredPromptFields({
     () => assembleNegativePrompt(selectedSeg, draft, FORGE_DEFAULT_NEGATIVE_PROMPT),
     [selectedSeg, draft],
   );
-  const usesStructured = segmentUsesStructuredAssembly(draft, selectedSeg);
-  const touchedInputRef = useRef<HTMLInputElement>(null);
-  const charById = useMemo(() => new Map(draft.characters.map((c) => [c.id, c])), [draft]);
+  const budgets = useMemo(() => mergeFieldBudgets(draft), [draft]);
+
+  const segmentOrder = useMemo(
+    () => resolveAssemblyOrder(draft, selectedSeg),
+    [draft, selectedSeg],
+  );
+
+  const assemblySegPreset = useMemo((): "project" | "motion_first" | "character_first" | "custom" => {
+    const ov = selectedSeg.assembly_override;
+    if (ov == null || ov === "project") return "project";
+    if (ov === "motion_first") return "motion_first";
+    if (ov === "character_first") return "character_first";
+    return "custom";
+  }, [selectedSeg.assembly_override]);
+
+  const projectOrder = useMemo(() => projectAssemblyOrder(draft), [draft]);
+
+  const [interactionOpen, setInteractionOpen] = useState(
+    (selectedSeg.interaction?.trim() ?? "") !== "",
+  );
 
   const active: SegmentActiveCharacter[] = selectedSeg.active_characters ?? [];
 
@@ -84,7 +159,7 @@ export function SegmentStructuredPromptFields({
       const list = [...(s.active_characters ?? [])];
       const ix = list.findIndex((a) => a.character_id === characterId);
       if (ix === -1) return p;
-      list[ix] = { character_id: characterId, variant_id: variantId };
+      list[ix] = { ...list[ix]!, character_id: characterId, variant_id: variantId };
       s.active_characters = list;
       return p;
     });
@@ -106,6 +181,97 @@ export function SegmentStructuredPromptFields({
       if (!s) return p;
       s.active_characters = active.filter((a) => a.character_id !== characterId);
       if (s.active_characters.length === 0) s.active_characters = undefined;
+      return p;
+    });
+  }
+
+  const usesStructured = segmentUsesStructuredAssembly(draft, selectedSeg);
+  const touchedInputRef = useRef<HTMLInputElement>(null);
+  const charById = useMemo(() => new Map(draft.characters.map((c) => [c.id, c])), [draft]);
+
+  const motionInWc = useDebouncedWordCount(selectedSeg.motion_in ?? "", 200);
+  const motionInSev = severityForFieldCount("motion", motionInWc, budgets);
+  const beatWc = useDebouncedWordCount(selectedSeg.beat ?? "", 200);
+  const beatSev = severityForFieldCount("beat", beatWc, budgets);
+  const interactionWc = useDebouncedWordCount(selectedSeg.interaction ?? "", 200);
+  const interactionSev = severityForFieldCount("interaction", interactionWc, budgets);
+  const cameraWc = useDebouncedWordCount(selectedSeg.camera_intent ?? "", 200);
+  const cameraSev = severityForFieldCount("camera", cameraWc, budgets);
+  const settingDesc =
+    selectedSeg.location_id?.trim() !== ""
+      ? (maps.locationsById.get(selectedSeg.location_id!.trim())?.descriptor_block ?? "")
+      : "";
+  const settingWc = useDebouncedWordCount(settingDesc, 200);
+  const settingSev = severityForFieldCount("setting", settingWc, budgets);
+
+  const styleDesc = useMemo(() => {
+    const styleId =
+      (selectedSeg.style_block_id_override?.trim() ?? "") !== ""
+        ? selectedSeg.style_block_id_override!.trim()
+        : (draft.default_style_block_id?.trim() ?? "");
+    if (styleId === "") return "";
+    return maps.styleBlocksById.get(styleId)?.descriptor_block ?? "";
+  }, [
+    selectedSeg.style_block_id_override,
+    draft.default_style_block_id,
+    maps.styleBlocksById,
+  ]);
+  const styleWc = useDebouncedWordCount(styleDesc, 200);
+  const styleSev = severityForFieldCount("style", styleWc, budgets);
+
+  const charBlockApprox = useMemo(() => {
+    const mode = selectedSeg.descriptor_mode ?? "full";
+    if (mode === "none") return "";
+    const activeC = selectedSeg.active_characters ?? [];
+    if (activeC.length === 0) return "";
+    const parts: string[] = [];
+    for (const ac of activeC) {
+      const ch = maps.charactersById.get(ac.character_id);
+      if (!ch) continue;
+      const variantId = ac.variant_id;
+      const text =
+        variantId != null && variantId !== "" && ch.variants?.[variantId] != null
+          ? ch.variants[variantId]!
+          : ch.descriptor_block;
+      if (text.trim()) parts.push(text.trim());
+    }
+    if (parts.length === 0) return "";
+    if (mode === "reference") {
+      return `Characters: ${parts.join(" ")}.`;
+    }
+    return `Characters: ${parts.join(". ")}`;
+  }, [selectedSeg.active_characters, selectedSeg.descriptor_mode, maps.charactersById]);
+  const charWc = useDebouncedWordCount(charBlockApprox, 200);
+  const charSev = severityForFieldCount("characters", charWc, budgets);
+
+  const totalWc = useDebouncedWordCount(
+    usesStructured || draft.structured_prompts ? previewPos : selectedSeg.prompt ?? "",
+    200,
+  );
+  const totalSev = severityForTotalWordCount(totalWc);
+
+  function positionSelectValue(pos: SpatialPosition | undefined): string {
+    if (pos == null) return "__none__";
+    if (typeof pos === "object" && "custom" in pos) return "__custom__";
+    return pos;
+  }
+
+  function setActiveCharPosition(characterId: string, sel: string, customText: string) {
+    patchDraft((p) => {
+      const s = p.segments.find((x) => x.id === selectedSeg.id);
+      if (!s) return p;
+      const list = [...(s.active_characters ?? [])];
+      const ix = list.findIndex((a) => a.character_id === characterId);
+      if (ix === -1) return p;
+      const prev = list[ix]!;
+      let position: SpatialPosition | undefined;
+      if (sel === "__none__") position = undefined;
+      else if (sel === "__custom__") {
+        const t = customText.trim();
+        position = t ? { custom: t } : undefined;
+      } else position = sel as SpatialPosition;
+      list[ix] = { ...prev, position };
+      s.active_characters = list;
       return p;
     });
   }
@@ -194,16 +360,30 @@ export function SegmentStructuredPromptFields({
             First in the Forge prompt when set: adds &quot;Continuing from the previous moment,&quot; then your
             motion line. Paste without repeating that phrase—it is injected automatically.
           </p>
-          <Textarea
-            rows={2}
-            value={selectedSeg.motion_in ?? ""}
-            onChange={(e) =>
-              patchDraft((p) => {
-                const s = p.segments.find((x) => x.id === selectedSeg.id);
-                if (s) s.motion_in = e.target.value || undefined;
-                return p;
-              })}
-          />
+          <div className={cn("relative rounded-md", fieldRingClass(motionInSev))}>
+            <Textarea
+              rows={2}
+              className="pb-6"
+              value={selectedSeg.motion_in ?? ""}
+              onChange={(e) =>
+                patchDraft((p) => {
+                  const s = p.segments.find((x) => x.id === selectedSeg.id);
+                  if (s) s.motion_in = e.target.value || undefined;
+                  return p;
+                })}
+            />
+            <span
+              className={cn(
+                "pointer-events-none absolute right-2 bottom-2 text-[11px]",
+                counterClass(motionInSev),
+              )}
+              title={
+                fieldTooltipForSeverity("motion", motionInWc, budgets) ?? FIELD_BUDGET_TOOLTIPS.motion
+              }
+            >
+              {motionInWc} words
+            </span>
+          </div>
         </div>
         <div className="space-y-1">
           <Label>Motion out (after review)</Label>
@@ -229,16 +409,67 @@ export function SegmentStructuredPromptFields({
         <p className="text-muted-foreground text-[11px] leading-snug">
           Scene action after motion continuity—primary narrative beat for short clips.
         </p>
-        <Textarea
-          rows={3}
-          value={selectedSeg.beat ?? ""}
-          onChange={(e) =>
-            patchDraft((p) => {
-              const s = p.segments.find((x) => x.id === selectedSeg.id);
-              if (s) s.beat = e.target.value || undefined;
-              return p;
-            })}
-        />
+        <div className={cn("relative rounded-md", fieldRingClass(beatSev))}>
+          <Textarea
+            rows={3}
+            className="pb-6"
+            value={selectedSeg.beat ?? ""}
+            onChange={(e) =>
+              patchDraft((p) => {
+                const s = p.segments.find((x) => x.id === selectedSeg.id);
+                if (s) s.beat = e.target.value || undefined;
+                return p;
+              })}
+          />
+          <span
+            className={cn(
+              "pointer-events-none absolute right-2 bottom-2 text-[11px]",
+              counterClass(beatSev),
+            )}
+            title={fieldTooltipForSeverity("beat", beatWc, budgets) ?? FIELD_BUDGET_TOOLTIPS.beat}
+          >
+            {beatWc} words
+          </span>
+        </div>
+      </div>
+
+      <div className="space-y-1">
+        <button
+          type="button"
+          className="text-muted-foreground hover:text-foreground flex w-full items-center gap-1 text-left text-xs font-medium"
+          onClick={() => setInteractionOpen((o) => !o)}
+        >
+          <span className={interactionOpen ? "rotate-90" : ""}>▸</span>
+          Interaction (optional)
+        </button>
+        {interactionOpen ? (
+          <div className={cn("relative rounded-md", fieldRingClass(interactionSev))}>
+            <Textarea
+              rows={2}
+              className="pb-6"
+              placeholder='e.g. "Watson hands Holmes a folded note, Holmes glances down then up sharply"'
+              value={selectedSeg.interaction ?? ""}
+              onChange={(e) =>
+                patchDraft((p) => {
+                  const s = p.segments.find((x) => x.id === selectedSeg.id);
+                  if (s) s.interaction = e.target.value || undefined;
+                  return p;
+                })}
+            />
+            <span
+              className={cn(
+                "pointer-events-none absolute right-2 bottom-2 text-[11px]",
+                counterClass(interactionSev),
+              )}
+              title={
+                fieldTooltipForSeverity("interaction", interactionWc, budgets) ??
+                FIELD_BUDGET_TOOLTIPS.interaction
+              }
+            >
+              {interactionWc} words
+            </span>
+          </div>
+        ) : null}
       </div>
 
       <div className="space-y-1">
@@ -246,16 +477,28 @@ export function SegmentStructuredPromptFields({
         <p className="text-muted-foreground text-[11px] leading-snug">
           Lens and framing intent—assembled right after beat. Duplicate camera vs motion/beat text is omitted.
         </p>
-        <Input
-          list={`camera-datalist-${selectedSeg.id}`}
-          value={selectedSeg.camera_intent ?? ""}
-          onChange={(e) =>
-            patchDraft((p) => {
-              const s = p.segments.find((x) => x.id === selectedSeg.id);
-              if (s) s.camera_intent = e.target.value || undefined;
-              return p;
-            })}
-        />
+        <div className={cn("relative", fieldRingClass(cameraSev))}>
+          <Input
+            className="pr-16"
+            list={`camera-datalist-${selectedSeg.id}`}
+            value={selectedSeg.camera_intent ?? ""}
+            onChange={(e) =>
+              patchDraft((p) => {
+                const s = p.segments.find((x) => x.id === selectedSeg.id);
+                if (s) s.camera_intent = e.target.value || undefined;
+                return p;
+              })}
+          />
+          <span
+            className={cn(
+              "pointer-events-none absolute right-2 top-1/2 -translate-y-1/2 text-[11px]",
+              counterClass(cameraSev),
+            )}
+            title={fieldTooltipForSeverity("camera", cameraWc, budgets) ?? FIELD_BUDGET_TOOLTIPS.camera}
+          >
+            {cameraWc} words
+          </span>
+        </div>
         <datalist id={`camera-datalist-${selectedSeg.id}`}>
           {CAMERA_PRESETS.map((c) => (
             <option key={c} value={c} />
@@ -319,7 +562,96 @@ export function SegmentStructuredPromptFields({
             })}
           </SelectContent>
         </Select>
+        {settingDesc.trim() !== "" ? (
+          <p
+            className={cn("text-[11px]", counterClass(settingSev))}
+            title={fieldTooltipForSeverity("setting", settingWc, budgets) ?? FIELD_BUDGET_TOOLTIPS.setting}
+          >
+            Setting descriptor (registry): {settingWc} words
+          </p>
+        ) : null}
       </div>
+
+      <div className="grid gap-2 sm:grid-cols-2">
+        <div className="space-y-1">
+          <Label>Character descriptors</Label>
+          <Select
+            value={selectedSeg.descriptor_mode ?? "full"}
+            onValueChange={(v) =>
+              patchDraft((p) => {
+                const s = p.segments.find((x) => x.id === selectedSeg.id);
+                if (!s) return p;
+                s.descriptor_mode = v as Segment["descriptor_mode"];
+                return p;
+              })}
+          >
+            <SelectTrigger>
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="full">Full — registry descriptors verbatim</SelectItem>
+              <SelectItem value="reference">Reference — names only</SelectItem>
+              <SelectItem value="none">None — omit Characters block</SelectItem>
+            </SelectContent>
+          </Select>
+        </div>
+        <div className="space-y-1">
+          <Label>Assembly (this clip)</Label>
+          <Select
+            value={assemblySegPreset}
+            onValueChange={(v) =>
+              patchDraft((p) => {
+                const s = p.segments.find((x) => x.id === selectedSeg.id);
+                if (!s) return p;
+                if (v === "project") {
+                  s.assembly_override = undefined;
+                  s.assembly_order_custom = undefined;
+                } else if (v === "motion_first") {
+                  s.assembly_override = "motion_first";
+                  s.assembly_order_custom = undefined;
+                } else if (v === "character_first") {
+                  s.assembly_override = "character_first";
+                  s.assembly_order_custom = undefined;
+                } else {
+                  s.assembly_override = "custom";
+                  s.assembly_order_custom = [...projectOrder];
+                }
+                return p;
+              })}
+          >
+            <SelectTrigger>
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="project">Project default</SelectItem>
+              <SelectItem value="motion_first">Motion-first</SelectItem>
+              <SelectItem value="character_first">Character-first</SelectItem>
+              <SelectItem value="custom">Custom (this segment)</SelectItem>
+            </SelectContent>
+          </Select>
+        </div>
+      </div>
+      {assemblySegPreset === "custom" ? (
+        <div className="max-w-md rounded-md border p-2">
+          <AssemblyOrderEditor
+            order={
+              selectedSeg.assembly_order_custom &&
+              isValidAssemblyOrder(selectedSeg.assembly_order_custom)
+                ? selectedSeg.assembly_order_custom
+                : [...MOTION_FIRST_ASSEMBLY_ORDER]
+            }
+            onOrderChange={(next) =>
+              patchDraft((p) => {
+                const s = p.segments.find((x) => x.id === selectedSeg.id);
+                if (!s) return p;
+                s.assembly_order_custom = next;
+                s.assembly_override = "custom";
+                return p;
+              })
+            }
+          />
+        </div>
+      ) : null}
 
       <div className="space-y-1">
         <Label>Active characters</Label>
@@ -357,18 +689,61 @@ export function SegmentStructuredPromptFields({
             return (
               <li
                 key={a.character_id}
-                className="flex flex-wrap items-center gap-2 rounded-md border px-2 py-1"
+                className="flex flex-col gap-2 rounded-md border px-2 py-2 sm:flex-row sm:flex-wrap sm:items-center"
               >
                 <span className="text-sm font-medium">{c.name}</span>
+                <div className="flex flex-wrap items-center gap-2">
+                  <Label className="text-muted-foreground text-xs">Position</Label>
+                  <Select
+                    value={positionSelectValue(a.position)}
+                    onValueChange={(v) => {
+                      if (v == null || v === "") return;
+                      const custom =
+                        typeof a.position === "object" && a.position && "custom" in a.position
+                          ? a.position.custom
+                          : "";
+                      setActiveCharPosition(a.character_id, v, custom);
+                    }}
+                  >
+                    <SelectTrigger className="h-8 w-[150px]">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="__none__">None</SelectItem>
+                      <SelectItem value="left">Left</SelectItem>
+                      <SelectItem value="right">Right</SelectItem>
+                      <SelectItem value="center">Center</SelectItem>
+                      <SelectItem value="foreground">Foreground</SelectItem>
+                      <SelectItem value="background">Background</SelectItem>
+                      <SelectItem value="left_of_frame">Left of frame</SelectItem>
+                      <SelectItem value="right_of_frame">Right of frame</SelectItem>
+                      <SelectItem value="__custom__">Custom…</SelectItem>
+                    </SelectContent>
+                  </Select>
+                  {positionSelectValue(a.position) === "__custom__" ? (
+                    <Input
+                      className="h-8 max-w-[200px]"
+                      placeholder="e.g. behind Watson"
+                      value={
+                        typeof a.position === "object" &&
+                        a.position &&
+                        "custom" in a.position
+                          ? a.position.custom
+                          : ""
+                      }
+                      onChange={(e) =>
+                        setActiveCharPosition(a.character_id, "__custom__", e.target.value)
+                      }
+                    />
+                  ) : null}
+                </div>
                 {variantKeys.length > 0 ? (
                   <Select
                     value={a.variant_id ?? "__base__"}
                     onValueChange={(v) =>
                       setActiveCharVariant(
                         a.character_id,
-                        v === "__base__" || v == null || v === ""
-                          ? undefined
-                          : v,
+                        v === "__base__" || v == null || v === "" ? undefined : v,
                       )
                     }
                   >
@@ -389,7 +764,7 @@ export function SegmentStructuredPromptFields({
                   type="button"
                   variant="ghost"
                   size="sm"
-                  className="text-destructive ml-auto"
+                  className="text-destructive sm:ml-auto"
                   onClick={() => removeActiveCharacter(a.character_id)}
                 >
                   Remove
@@ -398,6 +773,17 @@ export function SegmentStructuredPromptFields({
             );
           })}
         </ul>
+        {(selectedSeg.descriptor_mode ?? "full") !== "none" && active.length > 0 ? (
+          <p
+            className={cn("text-[11px]", counterClass(charSev))}
+            title={
+              fieldTooltipForSeverity("characters", charWc, budgets) ??
+              FIELD_BUDGET_TOOLTIPS.characters
+            }
+          >
+            Characters block (approx.): {charWc} words
+          </p>
+        ) : null}
       </div>
 
       <div className="space-y-1">
@@ -458,10 +844,33 @@ export function SegmentStructuredPromptFields({
             })}
           </SelectContent>
         </Select>
+        {styleDesc.trim() !== "" ? (
+          <p
+            className={cn("text-[11px]", counterClass(styleSev))}
+            title={fieldTooltipForSeverity("style", styleWc, budgets) ?? FIELD_BUDGET_TOOLTIPS.style}
+          >
+            Style block (registry): {styleWc} words
+          </p>
+        ) : null}
       </div>
 
       <div className="space-y-1 rounded-md border bg-muted/30 p-3">
-        <Label className="text-xs">Live assembled prompt</Label>
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <Label className="text-xs">Live assembled prompt</Label>
+          {usesStructured || draft.structured_prompts ? (
+            <span
+              className={cn("text-[11px]", counterClass(totalSev))}
+              title={totalTooltipForSeverity(totalWc) ?? undefined}
+            >
+              {totalWc} words — estimated ~{estimatedTokensFromWords(totalWc)} tokens
+            </span>
+          ) : null}
+        </div>
+        {usesStructured || draft.structured_prompts ? (
+          <p className="text-muted-foreground text-[10px] leading-snug">
+            Order: {segmentOrder.map((f) => ASSEMBLY_FIELD_LABELS[f]).join(" \u2192 ")}
+          </p>
+        ) : null}
         <p className="text-xs leading-relaxed whitespace-pre-wrap">
           {(() => {
             const legacy = selectedSeg.prompt?.trim() ?? "";
@@ -474,6 +883,22 @@ export function SegmentStructuredPromptFields({
             return legacy !== "" ? legacy : "(legacy prompt empty)";
           })()}
         </p>
+        {onAssemblyAbCompare && (usesStructured || draft.structured_prompts) ? (
+          <div className="space-y-1 border-t pt-2">
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              onClick={() => onAssemblyAbCompare()}
+            >
+              Generate variant with alternate order
+            </Button>
+            <p className="text-muted-foreground text-[10px] leading-snug">
+              Queues a single-clip snapshot with motion-first vs character-first assembly (same seed).
+              Pick the winner when both finish.
+            </p>
+          </div>
+        ) : null}
         <Label className="mt-2 text-xs">Negative (effective)</Label>
         <p className="text-muted-foreground text-xs">{previewNeg}</p>
         {selectedSeg.published_generation ? (

@@ -21,6 +21,7 @@ import { Label } from "@/components/ui/label";
 
 type ProjectSummary = {
   id: string;
+  slug: string;
   name: string;
   updated_at: string;
   segment_count: number;
@@ -47,7 +48,7 @@ export default function HomePage() {
         body: JSON.stringify({ name }),
       });
       if (!res.ok) throw new Error("Failed to create project");
-      return res.json() as Promise<{ project: { id: string } }>;
+      return res.json() as Promise<{ project: { id: string; slug: string } }>;
     },
     onSuccess: () => qc.invalidateQueries({ queryKey: ["projects"] }),
   });
@@ -83,11 +84,11 @@ export default function HomePage() {
         const j = await res.json().catch(() => ({}));
         throw new Error((j as { error?: string }).error ?? "Import failed");
       }
-      return res.json() as Promise<{ project: { id: string } }>;
+      return res.json() as Promise<{ project: { id: string; slug: string } }>;
     },
     onSuccess: (d) => {
       qc.invalidateQueries({ queryKey: ["projects"] });
-      router.push(`/project/${d.project.id}`);
+      router.push(`/project/${d.project.slug}`);
     },
   });
 
@@ -107,7 +108,7 @@ export default function HomePage() {
               e.preventDefault();
               const n = name.trim() || "Untitled";
               createMutation.mutate(n, {
-                onSuccess: (d) => router.push(`/project/${d.project.id}`),
+                onSuccess: (d) => router.push(`/project/${d.project.slug}`),
               });
               setName("");
             }}
@@ -170,8 +171,8 @@ export default function HomePage() {
         ) : (
           <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
             {(data?.projects ?? []).map((p) => (
-              <div key={p.id} className="relative">
-                <Link href={`/project/${p.id}`} className="block">
+              <div key={p.slug} className="relative">
+                <Link href={`/project/${encodeURIComponent(p.slug)}`} className="block">
                   <Card className="h-full pr-14 transition hover:border-primary/40">
                     <CardHeader>
                       <CardTitle className="text-lg">{p.name}</CardTitle>
@@ -182,8 +183,8 @@ export default function HomePage() {
                       </CardDescription>
                     </CardHeader>
                     <CardContent>
-                      <span className="text-muted-foreground text-xs font-mono">
-                        {p.id}
+                      <span className="text-muted-foreground text-xs font-mono" title="Folder name and URL">
+                        {p.slug}
                       </span>
                     </CardContent>
                   </Card>
@@ -202,7 +203,7 @@ export default function HomePage() {
                       `Delete project "${p.name}" and all of its data on disk (segments, snapshots, inputs)? This cannot be undone.`,
                     );
                     if (!ok) return;
-                    deleteMutation.mutate(p.id);
+                    deleteMutation.mutate(p.slug);
                   }}
                 >
                   <Trash2 className="mr-1 size-4" aria-hidden />

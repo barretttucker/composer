@@ -1,11 +1,24 @@
 import { NextResponse } from "next/server";
 
+import {
+  assertValidProjectFolderKey,
+  assertValidRunFolderKey,
+} from "@/lib/project-slug";
 import { loadRunRecord, saveRunRecord } from "@/lib/run-store";
 
 type Params = { params: Promise<{ projectId: string; runId: string }> };
 
 export async function PATCH(req: Request, context: Params) {
   const { projectId, runId } = await context.params;
+  try {
+    assertValidProjectFolderKey(projectId);
+    assertValidRunFolderKey(runId);
+  } catch (e) {
+    return NextResponse.json(
+      { error: e instanceof Error ? e.message : "Invalid path" },
+      { status: 400 },
+    );
+  }
   let body: Record<string, unknown> = {};
   try {
     body = await req.json();

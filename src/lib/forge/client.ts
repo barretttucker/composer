@@ -6,6 +6,7 @@ import { gunzipSync, inflateRawSync, inflateSync } from "node:zlib";
 import type { AppProfile } from "@/lib/app-config/profiles";
 import { normalizeForgeBaseUrl } from "@/lib/app-config/profiles";
 import type { ForgeCatalog } from "@/lib/forge/types";
+import { parseForgeUpscalerNames } from "@/lib/forge/upscalers";
 import type { GenerationParams } from "@/lib/schemas/project";
 import {
   parseLoras,
@@ -40,9 +41,6 @@ export class ForgeImg2ImgError extends Error {
     this.responseDiagnostics = summarizeForgeImg2imgResponseForLog(raw);
   }
 }
-
-export const DEFAULT_NEGATIVE_PROMPT =
-  "worst quality, low quality, watermark, text, logo, blurry";
 
 async function fetchJson(
   baseUrl: string,
@@ -467,6 +465,32 @@ export function createForgeClient(
         method: "GET",
         timeoutMs: 30_000,
       }),
+
+    async listUpscalers(): Promise<string[]> {
+      const raw = await fetchJson(baseUrl, "/sdapi/v1/upscalers", {
+        method: "GET",
+        timeoutMs: discoveryTimeout,
+      });
+      return parseForgeUpscalerNames(raw);
+    },
+
+    async extraSingleImage(
+      payload: Record<string, unknown>,
+    ): Promise<{ imageBase64: string }> {
+      const raw = await fetchJson(baseUrl, "/sdapi/v1/extra-single-image", {
+        method: "POST",
+        body: JSON.stringify(payload),
+        timeoutMs,
+      });
+      if (!raw || typeof raw !== "object") {
+        throw new Error("Forge extra-single-image returned non-object JSON");
+      }
+      const img = (raw as Record<string, unknown>).image;
+      if (typeof img !== "string" || !img.trim()) {
+        throw new Error("Forge extra-single-image response missing string `image`");
+      }
+      return { imageBase64: img.trim() };
+    },
 
     async img2img(payload: Record<string, unknown>): Promise<Img2ImgResult> {
       const apiPath = "/sdapi/v1/img2img";

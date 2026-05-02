@@ -17,16 +17,38 @@ import {
   extractChainFrame,
   stitchConcat,
 } from "@/lib/ffmpeg/index";
+import { applyChainHygiene } from "@/lib/orchestrator/chain_hygiene";
 import {
   loadProject,
   publishSegmentCanonicalArtifacts,
+  readCanonicalSegmentArtifacts,
   resolveSegmentInitImageAbs,
+  saveProject,
   seedFrameRelUsedForSegment,
   startFramePath,
   wireNextSegmentSeedAfterPublish,
 } from "@/lib/project-store";
-import { buildRegistryMaps, effectiveNegativePrompt, effectivePositivePrompt } from "@/lib/prompt-assembly/assemble";
-import { mergeGenerationParams } from "@/lib/schemas/project";
+import {
+  abVariantBAssemblyOrder,
+  assemblyOrderLabel,
+  assemblyOrdersEqual,
+  assembleNegativePrompt,
+  buildRegistryMaps,
+  effectiveNegativePrompt,
+  effectivePositivePrompt,
+  projectAssemblyOrder,
+  resolveAssemblyOrder,
+} from "@/lib/prompt-assembly/assemble";
+import {
+  CHARACTER_FIRST_ASSEMBLY_ORDER,
+  MOTION_FIRST_ASSEMBLY_ORDER,
+} from "@/lib/schemas/project";
+import { wordCount } from "@/lib/prompt-assembly/budgets";
+import {
+  DEFAULT_GENERATION_SEED,
+  mergeGenerationParams,
+  type GenerationParams,
+} from "@/lib/schemas/project";
 import { isForgeRawHttpLogEnabled } from "@/lib/env";
 import {
   createRunSkeleton,
@@ -35,14 +57,17 @@ import {
   runFolder,
   saveRunRecord,
   segmentArtifactPathsInRun,
+  segmentArtifactPathsInRunAb,
 } from "@/lib/run-store";
 import {
   segmentEffectiveMergedParams,
   segmentRenderFingerprint,
 } from "@/lib/segment-render-fingerprint";
 import type { RunRecord, SegmentRunState } from "@/lib/schemas/run";
-import { createForgeNeoVideoBackend } from "@/lib/video-backend/forge-neo-backend";
-
+import {
+  createForgeNeoVideoBackend,
+  type ForgeNeoClient,
+} from "@/lib/video-backend/forge-neo-backend";
 import { broadcast } from "@/lib/orchestrator/broadcast";
 import {
   clearContinue,
@@ -73,6 +98,15 @@ function segmentMp4RelForProjectFileApi(runId: string, i: number): string {
   const { mp4Rel } = segmentArtifactPathsInRun(i);
   return path.posix.join("runs", runId, mp4Rel).replace(/\\/g, "/");
 }
+
+function segmentMp4RelForProjectFileApiAb(
+  runId: string,
+  i: number,
+  key: "a" | "b",
+): string {
+  const { mp4Rel } = segmentArtifactPathsInRunAb(i, key);
+  return path.posix.join("runs", runId, mp4Rel).replace(/\\/g, "/");
+}
 /** Dedupes poller: Forge often returns the same step/progress for many seconds while GPU-bound. */
 function forgeProgressSignature(raw: unknown): string {
   if (!raw || typeof raw !== "object") return "";
@@ -98,6 +132,7 @@ export async function executeProjectRun(params: {
     to_segment_index_exclusive?: number;
     seed_delta?: number;
     pause_mode?: boolean;
+    assembly_ab_compare?: boolean;
   };
 }): Promise<{ runId: string }> {
   const projectId = params.projectId;
@@ -139,6 +174,12 @@ export async function executeProjectRun(params: {
     throw new Error("to_segment_index_exclusive out of range");
   }
 
+  if (params.options?.assembly_ab_compare === true && toExclusive !== fromIndex + 1) {
+    throw new Error(
+      "Assembly A/B compare requires exactly one clip: set to_segment_index_exclusive to from_segment_index + 1 (e.g. Render this clip only).",
+    );
+  }
+
   const { record } = createRunSkeleton({
     projectId,
     profileId: profile.id,
@@ -149,6 +190,7 @@ export async function executeProjectRun(params: {
       seed_delta: seedDelta,
       pause_mode: pauseMode,
       replay_mode: "fresh",
+      assembly_ab_compare: params.options?.assembly_ab_compare,
     },
   });
 
@@ -206,6 +248,7 @@ async function runLoop(args: {
   );
 
   let record = loadRunRecord(projectId, runId);
+  const assemblyAbCompareRequested = record.options?.assembly_ab_compare === true;
   const baseFolder = runFolder(projectId, runId);
 
   let currentInputPath = startFramePath(projectId);
@@ -286,17 +329,31 @@ async function runLoop(args: {
         type: "log",
         message: `Skipping locked segment ${i} (reuse existing file)`,
       });
+      let hygieneTiming: Partial<
+        Pick<
+          SegmentRunState,
+          "chain_hygiene_frame_extraction_ms" | "chain_hygiene_sharpen_ms"
+        >
+      > = {};
       if (!fs.existsSync(lastFrameAbs)) {
-        await extractChainFrame(
+        hygieneTiming = await finalizeSegmentChainLastFrame({
           mp4Abs,
-          project.chaining.frame_offset,
           lastFrameAbs,
-        );
+          merged,
+          chainingFrameOffset: project.chaining.frame_offset,
+          forgeClient: client,
+          baseFolder,
+          projectId,
+          runId,
+          segmentIndex: i,
+          segmentId: segment.id,
+        });
       }
       updateSegmentState(record, segment.id, {
         status: "skipped",
         mp4_rel: mp4Rel.replace(/\\/g, "/"),
         last_frame_rel: lastFrameRel.replace(/\\/g, "/"),
+        ...hygieneTiming,
       });
       saveRunRecord(projectId, record);
       const mapsLocked = buildRegistryMaps(project);
@@ -350,6 +407,223 @@ async function runLoop(args: {
       segmentId: segment.id,
       index: i,
     });
+
+    const abCompare =
+      assemblyAbCompareRequested &&
+      toExclusive === fromIndex + 1 &&
+      i === fromIndex &&
+      !segment.locked;
+
+    if (abCompare) {
+      let lastForgePayloadAb: Record<string, unknown> | undefined;
+      try {
+        rawImg2imgWriter = isForgeRawHttpLogEnabled()
+          ? (rec) =>
+              writeForgeImg2imgRawLogFile(baseFolder, i, segment.id, rec)
+          : undefined;
+
+        const mapsAb = buildRegistryMaps(project);
+        const orderA = resolveAssemblyOrder(project, segment);
+        const orderB = abVariantBAssemblyOrder(project, segment);
+        const positiveA = effectivePositivePrompt(segment, project, mapsAb, {
+          order: orderA,
+        });
+        const positiveB = effectivePositivePrompt(segment, project, mapsAb, {
+          order: orderB,
+        });
+        const negativePromptAb = effectiveNegativePrompt(segment, project);
+
+        record.prompt_snapshot = record.prompt_snapshot ?? {};
+        record.prompt_snapshot[segment.id] = {
+          positive: positiveA,
+          negative: negativePromptAb,
+        };
+        record.updated_at = new Date().toISOString();
+        saveRunRecord(projectId, record);
+
+        const resolvedInitAb = resolveSegmentInitImageAbs({
+          projectId,
+          project,
+          segmentIndex: i,
+          chainCurrentAbs: currentInputPath,
+        });
+        const initB64Ab = fs.readFileSync(resolvedInitAb).toString("base64");
+
+        let mergedGen = merged;
+        if (mergedGen.seed < 0) {
+          mergedGen = mergeGenerationParams(mergedGen, {
+            seed: DEFAULT_GENERATION_SEED,
+          });
+        }
+
+        const pathsA = segmentArtifactPathsInRunAb(i, "a");
+        const pathsB = segmentArtifactPathsInRunAb(i, "b");
+        const mp4AbsA = path.join(baseFolder, pathsA.mp4Rel.replace(/\//g, path.sep));
+        const lastAbsA = path.join(
+          baseFolder,
+          pathsA.lastFrameRel.replace(/\//g, path.sep),
+        );
+        const mp4AbsB = path.join(baseFolder, pathsB.mp4Rel.replace(/\//g, path.sep));
+        const lastAbsB = path.join(
+          baseFolder,
+          pathsB.lastFrameRel.replace(/\//g, path.sep),
+        );
+
+        const runForgeAb = async (positive: string, mp4Abs: string) => {
+          let lastProgressSigL = "";
+          let lastProgressBroadcastAtL = 0;
+          const FORGE_PROGRESS_HEARTBEAT_MS_L = 15_000;
+          const progressTimerL = setInterval(async () => {
+            try {
+              const prog = await client.getProgress();
+              const sig = forgeProgressSignature(prog);
+              const now = Date.now();
+              const sigChanged = sig !== lastProgressSigL;
+              const heartbeat =
+                now - lastProgressBroadcastAtL >= FORGE_PROGRESS_HEARTBEAT_MS_L;
+              if (sigChanged || heartbeat) {
+                lastProgressSigL = sig;
+                lastProgressBroadcastAtL = now;
+                broadcast(projectId, runId, { type: "forge_progress", raw: prog });
+              }
+            } catch {
+              /* ignore */
+            }
+          }, 1000);
+          try {
+            const result = await backend.generate({
+              generation: mergedGen,
+              initImageBase64: initB64Ab,
+              prompt: positive,
+              negativePrompt: negativePromptAb,
+            });
+            lastForgePayloadAb = result.requestPayload;
+            await fs.promises.mkdir(path.dirname(mp4Abs), { recursive: true });
+            await fs.promises.writeFile(
+              mp4Abs,
+              Buffer.from(result.videoBase64, "base64"),
+            );
+            return result;
+          } finally {
+            clearInterval(progressTimerL);
+          }
+        };
+
+        const t0 = Date.now();
+        const resA = await runForgeAb(positiveA, mp4AbsA);
+        const t1 = Date.now();
+        mergedGen = mergeGenerationParams(mergedGen, { seed: resA.seedUsed });
+        const resB = await runForgeAb(positiveB, mp4AbsB);
+        const t2 = Date.now();
+
+        // Snapshot the params actually sent (post -1 promotion + matched seed)
+        // so pickAssemblyAbVariant can publish faithful merged_generation_params.
+        record.params_snapshot[segment.id] = mergedGen;
+
+        await finalizeSegmentChainLastFrame({
+          mp4Abs: mp4AbsA,
+          lastFrameAbs: lastAbsA,
+          merged: mergedGen,
+          chainingFrameOffset: project.chaining.frame_offset,
+          forgeClient: client,
+          baseFolder,
+          projectId,
+          runId,
+          segmentIndex: i,
+          segmentId: segment.id,
+        });
+        const hygieneB = await finalizeSegmentChainLastFrame({
+          mp4Abs: mp4AbsB,
+          lastFrameAbs: lastAbsB,
+          merged: mergedGen,
+          chainingFrameOffset: project.chaining.frame_offset,
+          forgeClient: client,
+          baseFolder,
+          projectId,
+          runId,
+          segmentIndex: i,
+          segmentId: segment.id,
+        });
+
+        const variants = [
+          {
+            key: "a" as const,
+            label: `${assemblyOrderLabel(orderA)} (variant A)`,
+            mp4_rel: pathsA.mp4Rel.replace(/\\/g, "/"),
+            last_frame_rel: pathsA.lastFrameRel.replace(/\\/g, "/"),
+            assembled_prompt: positiveA,
+            order: orderA,
+            seed_used: resA.seedUsed,
+            generation_ms: t1 - t0,
+            word_count: wordCount(positiveA),
+          },
+          {
+            key: "b" as const,
+            label: `${assemblyOrderLabel(orderB)} (variant B)`,
+            mp4_rel: pathsB.mp4Rel.replace(/\\/g, "/"),
+            last_frame_rel: pathsB.lastFrameRel.replace(/\\/g, "/"),
+            assembled_prompt: positiveB,
+            order: orderB,
+            seed_used: resB.seedUsed,
+            generation_ms: t2 - t1,
+            word_count: wordCount(positiveB),
+          },
+        ];
+
+        updateSegmentState(record, segment.id, {
+          status: "done",
+          mp4_rel: pathsA.mp4Rel.replace(/\\/g, "/"),
+          last_frame_rel: pathsA.lastFrameRel.replace(/\\/g, "/"),
+          seed_used: resB.seedUsed,
+          assembly_ab_pending_pick: true,
+          assembly_ab_variants: variants,
+          ...hygieneB,
+        });
+        record.updated_at = new Date().toISOString();
+        saveRunRecord(projectId, record);
+
+        broadcast(projectId, runId, {
+          type: "segment_finished",
+          segmentId: segment.id,
+          index: i,
+          mp4_rel: segmentMp4RelForProjectFileApiAb(runId, i, "a"),
+          assembly_ab_pending_pick: true,
+        });
+
+        currentInputPath = lastAbsA;
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        const forgeDiagnostics =
+          err instanceof ForgeImg2ImgError
+            ? {
+                response: err.responseDiagnostics,
+                ...(lastForgePayloadAb
+                  ? {
+                      request: summarizeForgeImg2imgRequestPayload(lastForgePayloadAb),
+                    }
+                  : {}),
+              }
+            : undefined;
+        updateSegmentState(record, segment.id, {
+          status: "failed",
+          error: msg,
+          ...(forgeDiagnostics ? { forge_diagnostics: forgeDiagnostics } : {}),
+        });
+        record.status = "failed";
+        record.updated_at = new Date().toISOString();
+        saveRunRecord(projectId, record);
+        broadcast(projectId, runId, {
+          type: "segment_failed",
+          segmentId: segment.id,
+          index: i,
+          error: msg,
+          ...(forgeDiagnostics ? { forge_diagnostics: forgeDiagnostics } : {}),
+        });
+        return;
+      }
+      record = loadRunRecord(projectId, runId);
+      continue;
+    }
 
     let lastForgePayload: Record<string, unknown> | undefined;
     try {
@@ -423,17 +697,30 @@ async function runLoop(args: {
         Buffer.from(videoBase64, "base64"),
       );
 
-      await extractChainFrame(
+      const hygieneTiming = await finalizeSegmentChainLastFrame({
         mp4Abs,
-        project.chaining.frame_offset,
         lastFrameAbs,
-      );
+        merged,
+        chainingFrameOffset: project.chaining.frame_offset,
+        forgeClient: client,
+        baseFolder,
+        projectId,
+        runId,
+        segmentIndex: i,
+        segmentId: segment.id,
+      });
+
+      // Snapshot/publish the params actually sent to Forge (with the seed
+      // used after Forge resolved any -1 to a concrete number).
+      const mergedSent = mergeGenerationParams(merged, { seed: seedUsed });
+      record.params_snapshot[segment.id] = mergedSent;
 
       updateSegmentState(record, segment.id, {
         status: "done",
         mp4_rel: mp4Rel.replace(/\\/g, "/"),
         last_frame_rel: lastFrameRel.replace(/\\/g, "/"),
         seed_used: seedUsed,
+        ...hygieneTiming,
       });
       record.updated_at = new Date().toISOString();
       saveRunRecord(projectId, record);
@@ -447,7 +734,7 @@ async function runLoop(args: {
         published: {
           assembled_prompt: positivePrompt,
           assembled_negative_prompt: negativePrompt,
-          merged_generation_params: merged,
+          merged_generation_params: mergedSent,
           seed_frame_rel_used: seedRelUsed,
         },
       });
@@ -517,6 +804,11 @@ async function runLoop(args: {
   }
 
   const doneSegments = project.segments.map((_, i) => {
+    const st = record.segment_states.find((s) => s.index === i);
+    const v0 = st?.assembly_ab_variants?.[0];
+    if (st?.assembly_ab_pending_pick && v0) {
+      return path.join(baseFolder, v0.mp4_rel.replace(/\//g, path.sep));
+    }
     const { mp4Rel } = segmentArtifactPathsInRun(i);
     return path.join(baseFolder, mp4Rel.replace(/\//g, path.sep));
   });
@@ -544,6 +836,58 @@ async function runLoop(args: {
   clearContinue(projectId, runId);
 }
 
+async function finalizeSegmentChainLastFrame(opts: {
+  mp4Abs: string;
+  lastFrameAbs: string;
+  merged: GenerationParams;
+  chainingFrameOffset: number;
+  forgeClient: ForgeNeoClient;
+  baseFolder: string;
+  projectId: string;
+  runId: string;
+  segmentIndex: number;
+  segmentId: string;
+}): Promise<
+  Partial<
+    Pick<
+      SegmentRunState,
+      "chain_hygiene_frame_extraction_ms" | "chain_hygiene_sharpen_ms"
+    >
+  >
+> {
+  const ch = opts.merged.chain_hygiene;
+  if (ch.enabled) {
+    const result = await applyChainHygiene(
+      opts.mp4Abs,
+      null,
+      ch,
+      opts.baseFolder,
+      opts.forgeClient,
+    );
+    await fs.promises.copyFile(result.conditioningPath, opts.lastFrameAbs);
+    broadcast(opts.projectId, opts.runId, {
+      type: "log",
+      message: `Chain hygiene (clip ${opts.segmentIndex + 1}): frame extract ${result.frame_extraction_ms}ms${
+        result.sharpen_ms != null ? `, sharpen ${result.sharpen_ms}ms` : ""
+      }`,
+    });
+    const patch: Partial<
+      Pick<
+        SegmentRunState,
+        "chain_hygiene_frame_extraction_ms" | "chain_hygiene_sharpen_ms"
+      >
+    > = {
+      chain_hygiene_frame_extraction_ms: result.frame_extraction_ms,
+    };
+    if (result.sharpen_ms != null) {
+      patch.chain_hygiene_sharpen_ms = result.sharpen_ms;
+    }
+    return patch;
+  }
+  await extractChainFrame(opts.mp4Abs, opts.chainingFrameOffset, opts.lastFrameAbs);
+  return {};
+}
+
 function updateSegmentState(
   record: RunRecord,
   segmentId: string,
@@ -557,6 +901,125 @@ function updateSegmentState(
     segment_id: segmentId,
     index: record.segment_states[idx].index,
   };
+}
+
+/**
+ * Apply chosen assembly-order variant to canonical segment outputs and project segment fields.
+ */
+export function pickAssemblyAbVariant(params: {
+  projectId: string;
+  runId: string;
+  segmentId: string;
+  variant: "a" | "b";
+}): void {
+  const { projectId, runId, segmentId, variant } = params;
+  const record = loadRunRecord(projectId, runId);
+  const st = record.segment_states.find((s) => s.segment_id === segmentId);
+  if (
+    !st?.assembly_ab_pending_pick ||
+    !st.assembly_ab_variants ||
+    st.assembly_ab_variants.length < 1
+  ) {
+    throw new Error("No pending assembly A/B comparison for this segment in this run.");
+  }
+  const picked = st.assembly_ab_variants.find((x) => x.key === variant);
+  if (!picked) {
+    throw new Error(`Unknown variant ${variant}`);
+  }
+  const baseFolder = runFolder(projectId, runId);
+  const mp4Abs = path.join(baseFolder, picked.mp4_rel.replace(/\//g, path.sep));
+  const lfAbs = path.join(baseFolder, picked.last_frame_rel.replace(/\//g, path.sep));
+  if (!fs.existsSync(mp4Abs) || !fs.existsSync(lfAbs)) {
+    throw new Error("Chosen variant media files are missing from the run folder.");
+  }
+
+  let project = loadProject(projectId);
+  const segIndex = project.segments.findIndex((s) => s.id === segmentId);
+  if (segIndex === -1) {
+    throw new Error("Segment not found in project.");
+  }
+  const segment = project.segments[segIndex]!;
+
+  // Choose the cleanest representation: prefer presets / project default over
+  // an opaque "custom" order so the UI surfaces a meaningful label.
+  const projectOrder = projectAssemblyOrder(project);
+  if (assemblyOrdersEqual(picked.order, projectOrder)) {
+    segment.assembly_override = "project";
+    segment.assembly_order_custom = undefined;
+  } else if (assemblyOrdersEqual(picked.order, MOTION_FIRST_ASSEMBLY_ORDER)) {
+    segment.assembly_override = "motion_first";
+    segment.assembly_order_custom = undefined;
+  } else if (assemblyOrdersEqual(picked.order, CHARACTER_FIRST_ASSEMBLY_ORDER)) {
+    segment.assembly_override = "character_first";
+    segment.assembly_order_custom = undefined;
+  } else {
+    segment.assembly_override = "custom";
+    segment.assembly_order_custom = [...picked.order];
+  }
+  saveProject(project);
+  project = loadProject(projectId);
+
+  const snapshot = record.params_snapshot?.[segmentId];
+  if (!snapshot) {
+    throw new Error("Run is missing params snapshot for this segment.");
+  }
+  // Reflect the actual seed used for the chosen variant; the snapshot stores
+  // the post-promotion params shared by both variants in this AB run.
+  const merged =
+    picked.seed_used != null
+      ? mergeGenerationParams(snapshot, { seed: picked.seed_used })
+      : snapshot;
+
+  let chainCurrentAbs = startFramePath(projectId);
+  if (segIndex > 0) {
+    const prev = project.segments[segIndex - 1]!;
+    const canon = readCanonicalSegmentArtifacts(projectId, prev.id);
+    if (!canon) {
+      throw new Error(
+        "Cannot resolve seed frame bookkeeping: previous segment has no canonical last frame.",
+      );
+    }
+    chainCurrentAbs = canon.lastFrameAbs;
+  }
+
+  const resolvedInit = resolveSegmentInitImageAbs({
+    projectId,
+    project,
+    segmentIndex: segIndex,
+    chainCurrentAbs,
+  });
+  const seedRelUsed = seedFrameRelUsedForSegment(project, segIndex, resolvedInit);
+  const neg = assembleNegativePrompt(segment, project);
+
+  publishSegmentCanonicalArtifacts({
+    projectId,
+    segmentId,
+    mp4SourceAbs: mp4Abs,
+    lastFrameSourceAbs: lfAbs,
+    fingerprint: segmentRenderFingerprint(project, segIndex),
+    published: {
+      assembled_prompt: picked.assembled_prompt,
+      assembled_negative_prompt: neg,
+      merged_generation_params: merged,
+      seed_frame_rel_used: seedRelUsed,
+    },
+  });
+
+  wireNextSegmentSeedAfterPublish(
+    projectId,
+    segIndex,
+    path.posix.join("segment_outputs", segmentId, "last_frame.png"),
+  );
+
+  updateSegmentState(record, segmentId, {
+    assembly_ab_pending_pick: undefined,
+    assembly_ab_variants: undefined,
+    mp4_rel: picked.mp4_rel.replace(/\\/g, "/"),
+    last_frame_rel: picked.last_frame_rel.replace(/\\/g, "/"),
+    seed_used: picked.seed_used,
+  });
+  record.updated_at = new Date().toISOString();
+  saveRunRecord(projectId, record);
 }
 
 export function resumeAfterPause(projectId: string, runId: string): boolean {

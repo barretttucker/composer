@@ -1,6 +1,21 @@
 import { z } from "zod";
 
-import { generationParamsSchema } from "@/lib/schemas/project";
+import { assemblyFieldSchema, generationParamsSchema } from "@/lib/schemas/project";
+
+export const assemblyAbVariantSchema = z.object({
+  key: z.enum(["a", "b"]),
+  label: z.string(),
+  mp4_rel: z.string(),
+  last_frame_rel: z.string(),
+  assembled_prompt: z.string(),
+  /** Assembly field order used to build this prompt (apply to segment on pick for fingerprint match). */
+  order: z.array(assemblyFieldSchema),
+  seed_used: z.number().optional(),
+  generation_ms: z.number().optional(),
+  word_count: z.number().optional(),
+});
+
+export type AssemblyAbVariant = z.infer<typeof assemblyAbVariantSchema>;
 
 export const segmentRunStateSchema = z.object({
   segment_id: z.string(),
@@ -19,6 +34,13 @@ export const segmentRunStateSchema = z.object({
   error: z.string().optional(),
   /** Present when Forge img2img returns JSON but no usable video (redacted shapes only). */
   forge_diagnostics: z.unknown().optional(),
+  /** Chain hygiene: PNG frame extraction timing (when enabled). */
+  chain_hygiene_frame_extraction_ms: z.number().optional(),
+  /** Chain hygiene: Forge extra-single-image + Lanczos downscale timing (when sharpen on). */
+  chain_hygiene_sharpen_ms: z.number().optional(),
+  /** Single-segment A/B assembly compare: canonical publish deferred until pick. */
+  assembly_ab_pending_pick: z.boolean().optional(),
+  assembly_ab_variants: z.array(assemblyAbVariantSchema).optional(),
 });
 
 export type SegmentRunState = z.infer<typeof segmentRunStateSchema>;
@@ -40,6 +62,8 @@ export const runRecordSchema = z.object({
       seed_delta: z.number().optional(),
       pause_mode: z.boolean().optional(),
       replay_mode: z.enum(["fresh", "exact_replay", "seed_variation"]).optional(),
+      /** When true with a single-segment window, run motion-first vs character-first prompts; defer publish. */
+      assembly_ab_compare: z.boolean().optional(),
     })
     .optional(),
   segment_states: z.array(segmentRunStateSchema),

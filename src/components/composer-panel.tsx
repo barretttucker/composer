@@ -1,6 +1,7 @@
 "use client";
 
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useMemo, useRef, useState } from "react";
 
@@ -43,8 +44,10 @@ import {
 import { Textarea } from "@/components/ui/textarea";
 import {
   ForgeCatalogPayload,
+  ForgeUpscalersPayload,
   ProjectSetupPanel,
 } from "@/components/project-setup-panel";
+import { AssemblyComparePanel } from "@/components/run/assembly-compare-panel";
 import { SegmentStructuredPromptFields } from "@/components/segment-structured-prompt-fields";
 import { SegmentSceneStrip } from "@/components/segment-scene-strip";
 import {
@@ -146,6 +149,13 @@ function ForgeRunRenderStatus({ state }: { state: ForgeRenderBarState }) {
   );
 }
 
+async function fetchForgeUpscalers(): Promise<ForgeUpscalersPayload> {
+  const res = await fetch("/api/forge/upscalers");
+  const j = (await res.json()) as { error?: string; upscalers?: string[] };
+  if (!res.ok) throw new Error(j.error ?? "Forge upscalers request failed");
+  return { upscalers: j.upscalers ?? [] };
+}
+
 async function fetchForgeCatalog(refresh: boolean): Promise<ForgeCatalogPayload> {
   const q = refresh ? "?refresh=1" : "";
   const res = await fetch(`/api/forge/catalog${q}`);
@@ -161,6 +171,7 @@ async function fetchForgeCatalog(refresh: boolean): Promise<ForgeCatalogPayload>
 
 export function ComposerPanel({ projectId }: { projectId: string }) {
   const qc = useQueryClient();
+  const router = useRouter();
 
   const projectQuery = useQuery({
     queryKey: ["project", projectId],
@@ -196,7 +207,16 @@ export function ComposerPanel({ projectId }: { projectId: string }) {
       if (!res.ok) throw new Error("Save failed");
       return res.json() as Promise<{ project: Project }>;
     },
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["project", projectId] }),
+    onSuccess: (data) => {
+      setDraft(structuredClone(data.project));
+      const nextSlug = data.project.slug;
+      if (nextSlug !== projectId) {
+        qc.removeQueries({ queryKey: ["project", projectId] });
+        router.replace(`/project/${nextSlug}`);
+      }
+      void qc.invalidateQueries({ queryKey: ["project", nextSlug] });
+      void qc.invalidateQueries({ queryKey: ["projects"] });
+    },
   });
 
   const addSegmentMutation = useMutation({
@@ -274,6 +294,20 @@ export function ComposerPanel({ projectId }: { projectId: string }) {
     },
   });
 
+  const forgeUpscalersQuery = useQuery({
+    queryKey: ["forge-upscalers"],
+    queryFn: fetchForgeUpscalers,
+    staleTime: 120_000,
+    retry: false,
+  });
+
+  const refreshForgeUpscalersMutation = useMutation({
+    mutationFn: fetchForgeUpscalers,
+    onSuccess: (data) => {
+      qc.setQueryData(["forge-upscalers"], data);
+    },
+  });
+
   const forgeCatalogQuery = useQuery({
     queryKey: ["forge-catalog"],
     queryFn: () => fetchForgeCatalog(false),
@@ -335,6 +369,7 @@ export function ComposerPanel({ projectId }: { projectId: string }) {
     mutationFn: async (payload: {
       from_segment_index: number;
       to_segment_index_exclusive?: number;
+      assembly_ab_compare?: boolean;
     }) => {
       const from_segment_index = Math.max(
         0,
@@ -349,6 +384,9 @@ export function ComposerPanel({ projectId }: { projectId: string }) {
         body.to_segment_index_exclusive = Math.floor(
           payload.to_segment_index_exclusive,
         );
+      }
+      if (payload.assembly_ab_compare === true) {
+        body.assembly_ab_compare = true;
       }
       const res = await fetch(`/api/projects/${projectId}/runs`, {
         method: "POST",
@@ -450,7 +488,8 @@ export function ComposerPanel({ projectId }: { projectId: string }) {
           void qc.invalidateQueries({ queryKey: ["runs", projectId] });
           setClipPreviewNonce((n) => n + 1);
           const sid = payload.segmentId;
-          if (typeof sid === "string" && sid.length > 0) {
+          const abPick = payload.assembly_ab_pending_pick === true;
+          if (typeof sid === "string" && sid.length > 0 && !abPick) {
             setLatestRenderedSegmentId(sid);
           }
           setPlaybackNonce((n) => n + 1);
@@ -575,6 +614,7 @@ export function ComposerPanel({ projectId }: { projectId: string }) {
         const j = (await projectRes.json().catch(() => ({}))) as { error?: string };
         throw new Error(j.error ?? "Save project failed");
       }
+      const projectBody = (await projectRes.json()) as { project: Project };
       const r = effectiveResolution(d);
       const res = await fetch("/api/config/project-setup-defaults", {
         method: "PUT",
@@ -589,11 +629,21 @@ export function ComposerPanel({ projectId }: { projectId: string }) {
         const j = (await res.json().catch(() => ({}))) as { error?: string };
         throw new Error(j.error ?? "Save defaults failed");
       }
-      return res.json() as Promise<{ setupDefaults: { updated_at: string } }>;
+      const setupBody = (await res.json()) as {
+        setupDefaults: { updated_at: string };
+      };
+      return { setupDefaults: setupBody.setupDefaults, project: projectBody.project };
     },
-    onSuccess: () => {
+    onSuccess: (data) => {
+      setDraft(structuredClone(data.project));
       qc.invalidateQueries({ queryKey: ["project-setup-defaults"] });
-      qc.invalidateQueries({ queryKey: ["project", projectId] });
+      const nextSlug = data.project.slug;
+      if (nextSlug !== projectId) {
+        qc.removeQueries({ queryKey: ["project", projectId] });
+        router.replace(`/project/${nextSlug}`);
+      }
+      void qc.invalidateQueries({ queryKey: ["project", nextSlug] });
+      void qc.invalidateQueries({ queryKey: ["projects"] });
     },
   });
 
@@ -650,6 +700,14 @@ export function ComposerPanel({ projectId }: { projectId: string }) {
     }
     return null;
   }, [draft?.segments, projectQuery.data?.segmentRenderHealth]);
+
+  const assemblyAbPending = useMemo(() => {
+    if (!activeRunId || !selectedSegmentId) return null;
+    const run = playbackRunsQuery.data?.runs.find((r) => r.id === activeRunId);
+    const st = run?.segment_states.find((s) => s.segment_id === selectedSegmentId);
+    if (!st?.assembly_ab_pending_pick || !st.assembly_ab_variants?.length) return null;
+    return { variants: st.assembly_ab_variants };
+  }, [activeRunId, selectedSegmentId, playbackRunsQuery.data?.runs]);
 
   if (!draft && projectQuery.isLoading) {
     return (
@@ -770,6 +828,8 @@ export function ComposerPanel({ projectId }: { projectId: string }) {
               res={res}
               forgeCatalogQuery={forgeCatalogQuery}
               refreshForgeCatalogMutation={refreshForgeCatalogMutation}
+              forgeUpscalersQuery={forgeUpscalersQuery}
+              refreshForgeUpscalersMutation={refreshForgeUpscalersMutation}
               forgePickersReady={forgePickersReady}
               checkpointItems={checkpointItems}
               vaeItems={vaeItems}
@@ -868,6 +928,14 @@ export function ComposerPanel({ projectId }: { projectId: string }) {
                 </Button>
               </CardHeader>
               <CardContent className="space-y-3">
+                {assemblyAbPending && activeRunId && selectedSeg ? (
+                  <AssemblyComparePanel
+                    projectId={projectId}
+                    runId={activeRunId}
+                    segmentId={selectedSeg.id}
+                    variants={assemblyAbPending.variants}
+                  />
+                ) : null}
                 <div className="space-y-1">
                   <Label>Clip length</Label>
                   <Select
@@ -918,6 +986,13 @@ export function ComposerPanel({ projectId }: { projectId: string }) {
                     setClipPreviewNonce((n) => n + 1);
                     qc.invalidateQueries({ queryKey: ["project", projectId] });
                   }}
+                  onAssemblyAbCompare={() =>
+                    timelineRenderMutation.mutate({
+                      from_segment_index: selectedIndex,
+                      to_segment_index_exclusive: selectedIndex + 1,
+                      assembly_ab_compare: true,
+                    })
+                  }
                 />
 
                 <div className="space-y-1">

@@ -10,6 +10,7 @@ type OrchestratorPayload =
       segmentId: string;
       index: number;
       mp4_rel: string;
+      assembly_ab_pending_pick?: boolean;
     }
   | {
       type: "segment_failed";

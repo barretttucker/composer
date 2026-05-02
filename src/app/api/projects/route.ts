@@ -8,10 +8,11 @@ import {
 
 export async function GET() {
   const ids = listProjectIds();
-  const projects = ids.map((id) => {
-    const p = loadProject(id);
+  const projects = ids.map((folderKey) => {
+    const p = loadProject(folderKey);
     return {
       id: p.id,
+      slug: p.slug,
       name: p.name,
       updated_at: p.updated_at,
       segment_count: p.segments.length,

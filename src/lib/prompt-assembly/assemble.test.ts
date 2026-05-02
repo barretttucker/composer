@@ -1,10 +1,16 @@
 import { describe, expect, it } from "vitest";
 
-import type { Project, Segment } from "@/lib/schemas/project";
+import {
+  CHARACTER_FIRST_ASSEMBLY_ORDER,
+  DEFAULT_CHAIN_HYGIENE,
+  type Project,
+  type Segment,
+} from "@/lib/schemas/project";
 import {
   assembleNegativePrompt,
   assemblePrompt,
   buildRegistryMaps,
+  injectSpatialPrefixesInProse,
   I2V_CONTINUITY_PREFIX,
   stripLeadingContinuityPhrase,
 } from "@/lib/prompt-assembly/assemble";
@@ -12,6 +18,7 @@ import {
 function baseProject(overrides: Partial<Project> = {}): Project {
   return {
     id: "p1",
+    slug: "p1",
     name: "Test",
     created_at: "",
     updated_at: "",
@@ -56,6 +63,7 @@ function baseProject(overrides: Partial<Project> = {}): Project {
       sampler: "Euler",
       scheduler: "Simple",
       seed: 1,
+      chain_hygiene: { ...DEFAULT_CHAIN_HYGIENE },
     },
     chaining: { frame_offset: -1, blend_frames: 0, fps: 16 },
     resolution: {
@@ -192,20 +200,80 @@ describe("assemblePrompt", () => {
     expect(out).not.toContain("Moody lighting");
   });
 
-  it("preserves multi-character order inside Characters section", () => {
-    const project = baseProject();
+  it("character-first order places Characters before motion", () => {
+    const project = baseProject({ structured_prompts: true });
     const segment = baseSegment({
+      motion_in: "steps forward",
+      beat: "They pause",
+      camera_intent: "static",
+    });
+    const maps = buildRegistryMaps(project);
+    const out = assemblePrompt(segment, project, maps, CHARACTER_FIRST_ASSEMBLY_ORDER);
+    const iChars = out.indexOf("Characters:");
+    const iCont = out.indexOf(I2V_CONTINUITY_PREFIX);
+    expect(iChars).toBeGreaterThan(-1);
+    expect(iCont).toBeGreaterThan(-1);
+    expect(iChars).toBeLessThan(iCont);
+  });
+
+  it("includes interaction between beat and camera in default order", () => {
+    const project = baseProject({ structured_prompts: true });
+    const segment = baseSegment({
+      motion_in: "",
+      beat: "Action one",
+      interaction: "They exchange a glance",
+      camera_intent: "push-in",
+    });
+    const maps = buildRegistryMaps(project);
+    const out = assemblePrompt(segment, project, maps);
+    const iBeat = out.indexOf("Action one");
+    const iInt = out.indexOf("They exchange a glance");
+    const iCam = out.indexOf("push-in");
+    expect(iInt).toBeGreaterThan(iBeat);
+    expect(iCam).toBeGreaterThan(iInt);
+  });
+
+  it("descriptor_mode reference uses names only", () => {
+    const project = baseProject({ structured_prompts: true });
+    const segment = baseSegment({
+      descriptor_mode: "reference",
+      motion_in: "",
+    });
+    const maps = buildRegistryMaps(project);
+    const out = assemblePrompt(segment, project, maps);
+    expect(out).toContain("Characters: A and B.");
+    expect(out).not.toContain("Alpha desc");
+  });
+
+  it("descriptor_mode none omits Characters block", () => {
+    const project = baseProject({ structured_prompts: true });
+    const segment = baseSegment({ descriptor_mode: "none", motion_in: "" });
+    const maps = buildRegistryMaps(project);
+    const out = assemblePrompt(segment, project, maps);
+    expect(out).not.toContain("Characters:");
+  });
+
+  it("prefixes first beat mention with spatial hint", () => {
+    const project = baseProject({ structured_prompts: true });
+    const segment = baseSegment({
+      motion_in: "",
+      beat: "A lifts his pipe; B nods.",
       active_characters: [
-        { character_id: "c2" },
-        { character_id: "c1" },
+        { character_id: "c1", position: "left" },
+        { character_id: "c2", position: "right" },
       ],
     });
     const maps = buildRegistryMaps(project);
     const out = assemblePrompt(segment, project, maps);
-    const iBeta = out.indexOf("Beta desc");
-    const iAlpha = out.indexOf("Alpha desc");
-    expect(out).toContain("Characters:");
-    expect(iBeta).toBeLessThan(iAlpha);
+    expect(out).toMatch(/On the left,\s*A lifts/i);
+    expect(out).toMatch(/on the right,\s*B nods/i);
+  });
+
+  it("injectSpatialPrefixesInProse only prefixes first mention per name", () => {
+    const s = injectSpatialPrefixesInProse("A speaks. A waits.", [
+      { name: "A", leadIn: "On the left" },
+    ]);
+    expect(s.match(/On the left/g)?.length).toBe(1);
   });
 });
 

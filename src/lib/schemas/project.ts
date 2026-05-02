@@ -1,5 +1,26 @@
 import { z } from "zod";
 
+import { PROJECT_FOLDER_KEY_RE } from "@/lib/project-slug";
+
+export const chainHygieneSchema = z.object({
+  enabled: z.boolean(),
+  /** Negative offset from last frame: -1 = last frame, -3 ≈ third-to-last (recommended). */
+  frame_offset: z.number().int().min(-10).max(-1),
+  /** Forge `extra-single-image` 2× upscale then Lanczos downscale back to chain frame size. */
+  sharpen: z.boolean(),
+  /** Forge upscaler name (see /sdapi/v1/upscalers), e.g. SwinIR_4x or SwinIR 4x. */
+  upscaler: z.string(),
+});
+
+export type ChainHygieneParams = z.infer<typeof chainHygieneSchema>;
+
+export const DEFAULT_CHAIN_HYGIENE: ChainHygieneParams = {
+  enabled: false,
+  frame_offset: -3,
+  sharpen: false,
+  upscaler: "SwinIR_4x",
+};
+
 export const generationParamsSchema = z.object({
   checkpoint_high: z.string(),
   checkpoint_low: z.string(),
@@ -18,6 +39,7 @@ export const generationParamsSchema = z.object({
   sampler: z.string(),
   scheduler: z.string(),
   seed: z.number(),
+  chain_hygiene: chainHygieneSchema.default(DEFAULT_CHAIN_HYGIENE),
 });
 
 export type GenerationParams = z.infer<typeof generationParamsSchema>;
@@ -26,7 +48,18 @@ export function mergeGenerationParams(
   defaults: GenerationParams,
   override?: Partial<GenerationParams>,
 ): GenerationParams {
-  return generationParamsSchema.parse({ ...defaults, ...override });
+  const ov = override ?? {};
+  const mergedChainHygiene = chainHygieneSchema.parse({
+    ...defaults.chain_hygiene,
+    ...(ov.chain_hygiene ?? {}),
+  });
+  const restOverride: Partial<GenerationParams> = { ...ov };
+  delete restOverride.chain_hygiene;
+  return generationParamsSchema.parse({
+    ...defaults,
+    ...restOverride,
+    chain_hygiene: mergedChainHygiene,
+  });
 }
 
 export const characterSchema = z.object({
@@ -60,9 +93,92 @@ export type StyleBlock = z.infer<typeof styleBlockSchema>;
 export const seedFrameSourceSchema = z.enum(["chained", "fresh", "touched_up"]);
 export type SeedFrameSource = z.infer<typeof seedFrameSourceSchema>;
 
+export const ASSEMBLY_FIELDS = [
+  "motion",
+  "beat",
+  "interaction",
+  "camera",
+  "setting",
+  "characters",
+  "style",
+] as const;
+export type AssemblyField = (typeof ASSEMBLY_FIELDS)[number];
+
+export const assemblyFieldSchema = z.enum(ASSEMBLY_FIELDS);
+
+/** Default motion-first assembly (interaction between beat and camera when non-empty). */
+export const MOTION_FIRST_ASSEMBLY_ORDER: AssemblyField[] = [
+  "motion",
+  "beat",
+  "interaction",
+  "camera",
+  "setting",
+  "characters",
+  "style",
+];
+
+export const CHARACTER_FIRST_ASSEMBLY_ORDER: AssemblyField[] = [
+  "characters",
+  "motion",
+  "beat",
+  "interaction",
+  "camera",
+  "setting",
+  "style",
+];
+
+export const assemblyConfigSchema = z.object({
+  order: z.array(assemblyFieldSchema),
+});
+
+export type AssemblyConfig = z.infer<typeof assemblyConfigSchema>;
+
+export const fieldBudgetEntrySchema = z.object({
+  target_min: z.number().int().min(0),
+  target_max: z.number().int().min(0),
+  soft_max: z.number().int().min(0),
+  hard_cap: z.number().int().min(0),
+});
+
+export type FieldBudgetEntry = z.infer<typeof fieldBudgetEntrySchema>;
+
+export const fieldBudgetsSchema = z.record(assemblyFieldSchema, fieldBudgetEntrySchema);
+
+export type FieldBudgets = z.infer<typeof fieldBudgetsSchema>;
+
+export const spatialPositionEnumSchema = z.enum([
+  "left",
+  "right",
+  "center",
+  "foreground",
+  "background",
+  "left_of_frame",
+  "right_of_frame",
+]);
+
+export const spatialPositionSchema = z.union([
+  spatialPositionEnumSchema,
+  z.object({ custom: z.string().min(1) }),
+]);
+
+export type SpatialPosition = z.infer<typeof spatialPositionSchema>;
+
+export const segmentAssemblyOverrideSchema = z.enum([
+  "project",
+  "motion_first",
+  "character_first",
+  "custom",
+]);
+
+export type SegmentAssemblyOverride = z.infer<typeof segmentAssemblyOverrideSchema>;
+
+export const descriptorModeSchema = z.enum(["full", "reference", "none"]);
+export type DescriptorMode = z.infer<typeof descriptorModeSchema>;
+
 export const segmentActiveCharacterSchema = z.object({
   character_id: z.string(),
   variant_id: z.string().optional(),
+  position: spatialPositionSchema.optional(),
 });
 
 export type SegmentActiveCharacter = z.infer<typeof segmentActiveCharacterSchema>;
@@ -105,6 +221,13 @@ export const segmentSchema = z.object({
   style_block_id_override: z.string().optional(),
   motion_in: z.string().optional(),
   motion_out: z.string().optional(),
+  interaction: z.string().optional(),
+  /** How character registry text appears in the Characters block. */
+  descriptor_mode: descriptorModeSchema.default("full"),
+  /** Override project assembly order for this segment (for experiments). */
+  assembly_override: segmentAssemblyOverrideSchema.optional(),
+  /** When assembly_override is custom; must be a permutation of AssemblyField for best results. */
+  assembly_order_custom: z.array(assemblyFieldSchema).optional(),
   seed_frame_source: seedFrameSourceSchema.optional(),
   /** Project-root-relative path to PNG seed (fresh / touched_up / explicit). */
   seed_frame_rel: z.string().optional(),
@@ -125,6 +248,8 @@ export function segmentUsesStructuredAssembly(project: Project, segment: Segment
   const motionIn = segment.motion_in?.trim() ?? "";
   if (motionIn !== "") return true;
   if (segment.style_block_id_override && segment.style_block_id_override.trim() !== "") return true;
+  const interaction = segment.interaction?.trim() ?? "";
+  if (interaction !== "") return true;
   return false;
 }
 
@@ -164,7 +289,10 @@ export type ResolutionSettings = z.infer<typeof resolutionSettingsSchema>;
 
 export const projectSchema = z
   .object({
+    /** Stable identifier (never changes); exports and imports reference this. */
     id: z.string(),
+    /** Folder name under COMPOSER_PROJECTS_ROOT and `/project/[slug]` URL segment. */
+    slug: z.string().regex(PROJECT_FOLDER_KEY_RE),
     name: z.string(),
     created_at: z.string(),
     updated_at: z.string(),
@@ -182,6 +310,9 @@ export const projectSchema = z
     style_block_ids: z.array(z.string()).default([]),
     default_style_block_id: z.string().optional(),
     default_negative_prompt: z.string().optional(),
+    assembly_config: assemblyConfigSchema.optional(),
+    /** Per-field soft word budgets; partial overrides merge with code defaults. */
+    field_budgets: fieldBudgetsSchema.optional(),
   })
   .superRefine((proj, ctx) => {
     const charIds = new Set(proj.characters.map((c) => c.id));
@@ -292,6 +423,7 @@ export const structuredProjectExportSchema = z.object({
   exported_at: z.string(),
   project: z.object({
     id: z.string(),
+    slug: z.string().regex(PROJECT_FOLDER_KEY_RE).optional(),
     name: z.string(),
     created_at: z.string(),
     updated_at: z.string(),
@@ -304,6 +436,8 @@ export const structuredProjectExportSchema = z.object({
     style_block_ids: z.array(z.string()),
     default_style_block_id: z.string().optional(),
     default_negative_prompt: z.string().optional(),
+    assembly_config: assemblyConfigSchema.optional(),
+    field_budgets: fieldBudgetsSchema.optional(),
     defaults: generationParamsSchema,
     chaining: chainingSchema,
     resolution: resolutionSettingsSchema.optional(),

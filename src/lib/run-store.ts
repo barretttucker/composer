@@ -9,6 +9,7 @@ import {
   runsDir,
   readCanonicalSegmentArtifacts,
 } from "@/lib/project-store";
+import { assertValidRunFolderKey } from "@/lib/project-slug";
 import { runRecordSchema, type RunRecord, type SegmentRunState } from "@/lib/schemas/run";
 import { ensureDir } from "@/lib/env";
 
@@ -23,6 +24,7 @@ export function nextRunFolderName(projectId: string): string {
 }
 
 export function runFolder(projectId: string, runId: string): string {
+  assertValidRunFolderKey(runId);
   return path.join(runsDir(projectId), runId);
 }
 
@@ -106,6 +108,21 @@ export function segmentArtifactPathsInRun(i: number): {
   return {
     mp4Rel: path.posix.join("segments", `seg_${pad}.mp4`),
     lastFrameRel: path.posix.join("segments", `seg_${pad}_lastframe.png`),
+  };
+}
+
+export function segmentArtifactPathsInRunAb(
+  i: number,
+  key: "a" | "b",
+): {
+  mp4Rel: string;
+  lastFrameRel: string;
+} {
+  const pad = String(i).padStart(2, "0");
+  const suf = key === "a" ? "_a" : "_b";
+  return {
+    mp4Rel: path.posix.join("segments", `seg_${pad}${suf}.mp4`),
+    lastFrameRel: path.posix.join("segments", `seg_${pad}${suf}_lastframe.png`),
   };
 }
 

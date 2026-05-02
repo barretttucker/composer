@@ -45,6 +45,11 @@ async function ffprobeFrameCount(videoPath: string): Promise<number> {
   }
 }
 
+export type ExtractChainFrameOptions = {
+  /** PNG zlib level for ffmpeg's PNG encoder (0 = uncompressed; smaller CPU, larger files). */
+  pngCompressionLevel?: number;
+};
+
 /**
  * @param frameOffsetFromEnd -1 = last frame, -2 = second-to-last (0-based indexing into frame sequence).
  */
@@ -52,7 +57,8 @@ export async function extractChainFrame(
   mp4Path: string,
   frameOffsetFromEnd: number,
   outputPngPath: string,
-): Promise<void> {
+  options?: ExtractChainFrameOptions,
+): Promise<{ totalFrames: number; extractedIndex: number }> {
   const total = await ffprobeFrameCount(mp4Path);
   const idx = total + frameOffsetFromEnd;
   if (idx < 0 || idx >= total) {
@@ -61,7 +67,7 @@ export async function extractChainFrame(
     );
   }
   fs.mkdirSync(path.dirname(outputPngPath), { recursive: true });
-  await execFileAsync("ffmpeg", [
+  const args: string[] = [
     "-y",
     "-i",
     mp4Path,
@@ -69,8 +75,13 @@ export async function extractChainFrame(
     `select=eq(n\\,${idx})`,
     "-vframes",
     "1",
-    outputPngPath,
-  ]);
+  ];
+  if (options?.pngCompressionLevel !== undefined) {
+    args.push("-compression_level", String(options.pngCompressionLevel));
+  }
+  args.push(outputPngPath);
+  await execFileAsync("ffmpeg", args);
+  return { totalFrames: total, extractedIndex: idx };
 }
 
 export async function stitchConcat(
@@ -87,16 +98,25 @@ export async function stitchConcat(
     .join("\n");
   fs.writeFileSync(listPath, lines, "utf8");
 
-  await execFileAsync("ffmpeg", [
-    "-y",
-    "-f",
-    "concat",
-    "-safe",
-    "0",
-    "-i",
-    listPath,
-    "-c",
-    "copy",
-    outputMp4Path,
-  ]);
+  try {
+    await execFileAsync("ffmpeg", [
+      "-y",
+      "-f",
+      "concat",
+      "-safe",
+      "0",
+      "-i",
+      listPath,
+      "-c",
+      "copy",
+      outputMp4Path,
+    ]);
+  } finally {
+    // Best-effort cleanup of the scratch concat list; never fails the caller.
+    try {
+      await fs.promises.unlink(listPath);
+    } catch {
+      // ignore
+    }
+  }
 }

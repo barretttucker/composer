@@ -1,9 +1,11 @@
 "use client";
 
 import type { ReactNode } from "react";
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { nanoid } from "nanoid";
 import { ChevronDown } from "lucide-react";
+
+import { AssemblyOrderEditor } from "@/components/assembly-order-editor";
 
 import { Button } from "@/components/ui/button";
 import {
@@ -23,8 +25,18 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
+import { projectAssemblyOrder } from "@/lib/prompt-assembly/assemble";
 import type { Project } from "@/lib/schemas/project";
+import {
+  CHARACTER_FIRST_ASSEMBLY_ORDER,
+  MOTION_FIRST_ASSEMBLY_ORDER,
+  type AssemblyField,
+} from "@/lib/schemas/project";
 import { cn } from "@/lib/utils";
+
+function ordersMatch(a: AssemblyField[], b: AssemblyField[]): boolean {
+  return a.length === b.length && a.every((x, i) => x === b[i]);
+}
 
 export function PromptRegistryPanel({
   draft,
@@ -41,6 +53,13 @@ export function PromptRegistryPanel({
   const locById = new Map(draft.locations.map((l) => [l.id, l]));
   const charById = new Map(draft.characters.map((c) => [c.id, c]));
   const styleById = new Map(draft.style_blocks.map((s) => [s.id, s]));
+
+  const projectOrder = useMemo(() => projectAssemblyOrder(draft), [draft]);
+  const assemblyPreset = useMemo((): "motion_first" | "character_first" | "custom" => {
+    if (ordersMatch(projectOrder, MOTION_FIRST_ASSEMBLY_ORDER)) return "motion_first";
+    if (ordersMatch(projectOrder, CHARACTER_FIRST_ASSEMBLY_ORDER)) return "character_first";
+    return "custom";
+  }, [projectOrder]);
 
   return (
     <Card>
@@ -80,6 +99,82 @@ export function PromptRegistryPanel({
           />
           Prefer structured assembly (uses beat / registry fields when set)
         </label>
+
+        <div className="space-y-2 border-t pt-3">
+          <Label>Assembly order</Label>
+          <p className="text-muted-foreground text-[11px] leading-snug">
+            Field order in the assembled prompt. Use Custom to drag-reorder. Empty fields are skipped
+            automatically.
+          </p>
+          <Select
+            value={assemblyPreset}
+            onValueChange={(v) => {
+              patchDraft((p) => {
+                if (!p.assembly_config) p.assembly_config = { order: [...MOTION_FIRST_ASSEMBLY_ORDER] };
+                if (v === "motion_first") {
+                  p.assembly_config.order = [...MOTION_FIRST_ASSEMBLY_ORDER];
+                } else if (v === "character_first") {
+                  p.assembly_config.order = [...CHARACTER_FIRST_ASSEMBLY_ORDER];
+                } else {
+                  if (
+                    ordersMatch(p.assembly_config.order, MOTION_FIRST_ASSEMBLY_ORDER) ||
+                    ordersMatch(p.assembly_config.order, CHARACTER_FIRST_ASSEMBLY_ORDER)
+                  ) {
+                    p.assembly_config.order = [...MOTION_FIRST_ASSEMBLY_ORDER];
+                  }
+                }
+                return p;
+              });
+            }}
+          >
+            <SelectTrigger className="w-full max-w-md">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="motion_first">Motion-first (default)</SelectItem>
+              <SelectItem value="character_first">Character-first</SelectItem>
+              <SelectItem value="custom">Custom</SelectItem>
+            </SelectContent>
+          </Select>
+          {assemblyPreset === "custom" ? (
+            <div className="max-w-md rounded-md border p-2">
+              <AssemblyOrderEditor
+                order={projectOrder}
+                onOrderChange={(next) =>
+                  patchDraft((p) => {
+                    if (!p.assembly_config) p.assembly_config = { order: next };
+                    else p.assembly_config.order = next;
+                    return p;
+                  })
+                }
+              />
+            </div>
+          ) : null}
+        </div>
+
+        <div className="space-y-1 border-t pt-3">
+          <Label>Field word budgets</Label>
+          <p className="text-muted-foreground text-[11px] leading-snug">
+            Per-field soft limits in the clip editor use project overrides when set. Most projects use
+            built-in defaults.
+          </p>
+          {draft.field_budgets ? (
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              onClick={() =>
+                patchDraft((p) => {
+                  p.field_budgets = undefined;
+                  return p;
+                })}
+            >
+              Clear overrides (use defaults)
+            </Button>
+          ) : (
+            <p className="text-muted-foreground text-xs">Built-in defaults active.</p>
+          )}
+        </div>
 
         <div className="space-y-1">
           <Label>Project default negative prompt</Label>

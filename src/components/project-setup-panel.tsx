@@ -13,6 +13,7 @@ import {
 } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Switch } from "@/components/ui/switch";
 import {
   Select,
   SelectContent,
@@ -47,12 +48,18 @@ export type ForgeCatalogPayload = {
   options?: unknown;
 };
 
+export type ForgeUpscalersPayload = {
+  upscalers: string[];
+};
+
 export function ProjectSetupPanel({
   draft,
   patchDraft,
   res,
   forgeCatalogQuery,
   refreshForgeCatalogMutation,
+  forgeUpscalersQuery,
+  refreshForgeUpscalersMutation,
   forgePickersReady,
   checkpointItems,
   vaeItems,
@@ -76,6 +83,13 @@ export function ProjectSetupPanel({
     void,
     unknown
   >;
+  forgeUpscalersQuery: UseQueryResult<ForgeUpscalersPayload, Error>;
+  refreshForgeUpscalersMutation: UseMutationResult<
+    ForgeUpscalersPayload,
+    Error,
+    void,
+    unknown
+  >;
   forgePickersReady: boolean;
   checkpointItems: { value: string; label: string }[];
   vaeItems: { value: string; label: string }[];
@@ -92,6 +106,15 @@ export function ProjectSetupPanel({
   const defaults = draft.defaults;
   const chaining = draft.chaining;
   const fpsRounded = Math.max(1, Math.round(chaining.fps));
+
+  const upscalerItems = useMemo(
+    () =>
+      (forgeUpscalersQuery.data?.upscalers ?? []).map((n) => ({
+        value: n,
+        label: n,
+      })),
+    [forgeUpscalersQuery.data?.upscalers],
+  );
 
   return (
     <Tabs defaultValue="canvas" className="flex flex-col gap-0">
@@ -271,6 +294,109 @@ export function ProjectSetupPanel({
           />
         </CardContent>
       </Card>
+
+      <details className="bg-card rounded-xl border shadow-sm">
+        <summary className="hover:bg-muted/30 [&::-webkit-details-marker]:hidden cursor-pointer list-none px-6 py-4">
+          <div className="flex flex-col gap-1 sm:flex-row sm:items-center sm:justify-between">
+            <span className="text-base font-semibold tracking-tight">Chain hygiene</span>
+            <span
+              className="text-muted-foreground max-w-[560px] text-xs leading-snug"
+              title="Reduces compounded softness when each clip seeds the next from an H.264 frame. Uses an earlier frame as uncompressed PNG and optionally Forge upscaler ×2 plus Lanczos downscale—WAN checkpoints stay loaded."
+            >
+              Default off for 1–3 clips; often worth enabling for longer chains (4+ segments).
+            </span>
+          </div>
+        </summary>
+        <div className="border-border space-y-4 border-t px-6 py-4">
+          <div className="flex flex-wrap items-center gap-3">
+            <div className="flex items-center gap-2">
+              <Switch
+                checked={defaults.chain_hygiene.enabled}
+                onCheckedChange={(checked) =>
+                  patchDraft((p) => {
+                    p.defaults.chain_hygiene.enabled = checked;
+                    return p;
+                  })
+                }
+              />
+              <Label className="text-sm font-normal">Enable between chained clips</Label>
+            </div>
+          </div>
+          <NumField
+            label="Hygiene frame offset (−1 … −10)"
+            value={defaults.chain_hygiene.frame_offset}
+            onChange={(v) =>
+              patchDraft((p) => {
+                const x = Math.round(Number(v));
+                p.defaults.chain_hygiene.frame_offset = Math.min(-1, Math.max(-10, x));
+                return p;
+              })}
+          />
+          <p className="text-muted-foreground text-[11px] leading-snug">
+            Extract frame at{" "}
+            <span className="font-mono">total_frames + offset</span> into uncompressed PNG.
+            Recommended <span className="font-mono">−3</span> (avoid the weakest final WAN frame).
+          </p>
+          <div className="flex flex-wrap items-center gap-3">
+            <div className="flex items-center gap-2">
+              <Switch
+                checked={defaults.chain_hygiene.sharpen}
+                onCheckedChange={(checked) =>
+                  patchDraft((p) => {
+                    p.defaults.chain_hygiene.sharpen = checked;
+                    return p;
+                  })
+                }
+              />
+              <Label className="text-sm font-normal">
+                Sharpen (Forge upscale ×2, Lanczos downscale)
+              </Label>
+            </div>
+          </div>
+          <div className="flex flex-col gap-3 sm:flex-row sm:flex-wrap sm:items-end">
+            <div className="min-w-[220px] flex-1">
+              <CatalogPickRow
+                label="Upscaler (Forge)"
+                value={defaults.chain_hygiene.upscaler}
+                items={upscalerItems}
+                disabled={
+                  !defaults.chain_hygiene.sharpen ||
+                  (forgeUpscalersQuery.isLoading && upscalerItems.length === 0)
+                }
+                onChange={(v) =>
+                  patchDraft((p) => {
+                    p.defaults.chain_hygiene.upscaler = v;
+                    return p;
+                  })
+                }
+              />
+            </div>
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              disabled={
+                refreshForgeUpscalersMutation.isPending || forgeUpscalersQuery.isFetching
+              }
+              onClick={() => {
+                void refreshForgeUpscalersMutation.mutateAsync();
+              }}
+            >
+              {refreshForgeUpscalersMutation.isPending || forgeUpscalersQuery.isFetching
+                ? "Loading…"
+                : "Reload upscaler list"}
+            </Button>
+          </div>
+          {forgeUpscalersQuery.isError ? (
+            <p className="text-destructive text-xs leading-snug">
+              Could not load Forge upscalers:{" "}
+              {forgeUpscalersQuery.error instanceof Error
+                ? forgeUpscalersQuery.error.message
+                : String(forgeUpscalersQuery.error)}
+            </p>
+          ) : null}
+        </div>
+      </details>
 
       </TabsContent>
 

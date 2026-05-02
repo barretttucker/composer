@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 
 import { getActiveProfile } from "@/lib/app-config/profiles";
 import { executeProjectRun } from "@/lib/orchestrator/run-project";
+import { assertValidProjectFolderKey } from "@/lib/project-slug";
 import { listRuns } from "@/lib/run-store";
 
 type Params = { params: Promise<{ projectId: string }> };
@@ -9,6 +10,7 @@ type Params = { params: Promise<{ projectId: string }> };
 export async function GET(_req: Request, context: Params) {
   const { projectId } = await context.params;
   try {
+    assertValidProjectFolderKey(projectId);
     const runs = listRuns(projectId);
     return NextResponse.json({ runs });
   } catch {
@@ -18,6 +20,14 @@ export async function GET(_req: Request, context: Params) {
 
 export async function POST(req: Request, context: Params) {
   const { projectId } = await context.params;
+  try {
+    assertValidProjectFolderKey(projectId);
+  } catch (e) {
+    return NextResponse.json(
+      { error: e instanceof Error ? e.message : "Invalid project path" },
+      { status: 400 },
+    );
+  }
   const profile = getActiveProfile();
   let body: Record<string, unknown> = {};
   try {
@@ -38,6 +48,9 @@ export async function POST(req: Request, context: Params) {
       ? body.to_segment_index_exclusive
       : undefined;
 
+  const assembly_ab_compare =
+    typeof body.assembly_ab_compare === "boolean" ? body.assembly_ab_compare : undefined;
+
   try {
     const result = await executeProjectRun({
       projectId,
@@ -47,6 +60,7 @@ export async function POST(req: Request, context: Params) {
         to_segment_index_exclusive,
         seed_delta,
         pause_mode,
+        assembly_ab_compare,
       },
     });
     return NextResponse.json(result);

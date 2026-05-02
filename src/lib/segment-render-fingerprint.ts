@@ -9,6 +9,7 @@ import {
 } from "@/lib/prompt-assembly/assemble";
 import {
   mergeGenerationParams,
+  segmentChainSourceIndex,
   segmentUsesChainInit,
   type Project,
 } from "@/lib/schemas/project";
@@ -49,10 +50,19 @@ export function segmentRenderFingerprint(
   const maps = buildRegistryMaps(project);
   const prompt = effectivePositivePrompt(segment, project, maps);
   const neg = effectiveNegativePrompt(segment, project);
+  // Encode the chain seed source so switching from "chained_previous" to
+  // "chained_from clip K" (or to a different K) marks the clip stale.
+  const chainKey = (() => {
+    if (!chain) return "fresh";
+    if (segment.seed_frame_source === "chained_from") {
+      return `from:${segment.seed_from_segment_id ?? ""}`;
+    }
+    return "prev";
+  })();
   const payload = [
     prompt,
     neg,
-    chain ? "1" : "0",
+    chainKey,
     String(dur),
     JSON.stringify(merged),
   ].join("\x1e");
@@ -66,12 +76,17 @@ export type SegmentRenderHealth = {
   chainStale: boolean[];
 };
 
+/**
+ * Walks the chain DAG (each segment has at most one upstream source). A clip is
+ * chain-stale when its chain source is itself stale (content-stale or chain-stale).
+ * Topological order matches segment order because chained_from must reference an
+ * earlier index (validated by the project schema).
+ */
 export function computeSegmentRenderHealth(project: Project): SegmentRenderHealth {
   const n = project.segments.length;
   const contentStale = new Array<boolean>(n).fill(false);
   const chainStale = new Array<boolean>(n).fill(false);
-
-  let upstreamBroken = false;
+  const isStale = new Array<boolean>(n).fill(false);
 
   for (let i = 0; i < n; i++) {
     const seg = project.segments[i];
@@ -79,19 +94,14 @@ export function computeSegmentRenderHealth(project: Project): SegmentRenderHealt
     const selfStale =
       seg.last_built_fingerprint === undefined ||
       seg.last_built_fingerprint !== fp;
-
     contentStale[i] = selfStale;
 
-    const usesChain = segmentUsesChainInit(seg, i);
-    if (i > 0 && usesChain && upstreamBroken) {
+    const sourceIdx = segmentChainSourceIndex(project, i);
+    if (sourceIdx != null && isStale[sourceIdx]) {
       chainStale[i] = true;
     }
 
-    if (usesChain) {
-      upstreamBroken = upstreamBroken || selfStale;
-    } else {
-      upstreamBroken = selfStale;
-    }
+    isStale[i] = selfStale || chainStale[i];
   }
 
   return { contentStale, chainStale };

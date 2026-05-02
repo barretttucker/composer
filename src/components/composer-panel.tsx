@@ -65,7 +65,23 @@ import type { SegmentHealthFlags } from "@/lib/segment-render-fingerprint";
 import { formatComposerRunEventLine } from "@/lib/sanitize-compose-log";
 import { framesForClipSeconds } from "@/lib/video-time";
 import { cn } from "@/lib/utils";
-import { ChevronDown, PanelLeft, ScrollText } from "lucide-react";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import {
+  ChevronDown,
+  Film,
+  PanelLeft,
+  PlayCircle,
+  ScrollText,
+  StopCircle,
+  Wand2,
+} from "lucide-react";
 import { useComposerStore } from "@/stores/composer-store";
 
 function runsFinalMp4ProjectRel(runId: string, finalRel: string): string {
@@ -491,6 +507,10 @@ export function ComposerPanel({ projectId }: { projectId: string }) {
           const abPick = payload.assembly_ab_pending_pick === true;
           if (typeof sid === "string" && sid.length > 0 && !abPick) {
             setLatestRenderedSegmentId(sid);
+            // Anchor the player to the just-finished clip so the user sees it
+            // immediately. The completed handler later promotes to "merged" if
+            // multiple clips finished in this run.
+            setPlaybackTab("single");
           }
           setPlaybackNonce((n) => n + 1);
         }
@@ -690,15 +710,20 @@ export function ComposerPanel({ projectId }: { projectId: string }) {
       ? JSON.stringify(draft) !== JSON.stringify(projectQuery.data.project)
       : false;
 
-  const firstStaleClipIndex = useMemo(() => {
-    if (!draft?.segments.length) return null;
+  const staleSummary = useMemo(() => {
+    if (!draft?.segments.length) return { firstIndex: null as number | null, count: 0 };
     const health = projectQuery.data?.segmentRenderHealth;
-    if (!health) return null;
+    if (!health) return { firstIndex: null as number | null, count: 0 };
+    let firstIndex: number | null = null;
+    let count = 0;
     for (let i = 0; i < draft.segments.length; i++) {
       const h = health[draft.segments[i]!.id];
-      if (h?.contentStale || h?.chainStale) return i;
+      if (h?.contentStale || h?.chainStale) {
+        if (firstIndex === null) firstIndex = i;
+        count += 1;
+      }
     }
-    return null;
+    return { firstIndex, count };
   }, [draft?.segments, projectQuery.data?.segmentRenderHealth]);
 
   const assemblyAbPending = useMemo(() => {
@@ -863,52 +888,63 @@ export function ComposerPanel({ projectId }: { projectId: string }) {
         }}
       />
 
-      <div className="grid gap-6 xl:grid-cols-[1fr_minmax(280px,380px)]">
-        <div className="space-y-5">
-          <div className="flex flex-col gap-3">
-            {dirty ? (
-              <p className="text-muted-foreground text-xs">
-                Continuity markers reflect the last saved project.
-              </p>
+      <div className="-mx-4 sticky top-0 z-30 mb-4 rounded-lg border shadow-sm">
+        <div className="bg-card flex items-center justify-between gap-3 border-b px-3 py-2">
+          <div className="flex items-center gap-2 text-sm font-medium">
+            <Film className="size-4" aria-hidden />
+            <span>Scene timeline</span>
+            {staleSummary.count > 0 ? (
+              <span className="ml-1 inline-flex items-center rounded-full bg-amber-100 px-2 py-0.5 text-[11px] font-semibold text-amber-900">
+                {staleSummary.count} stale
+              </span>
             ) : null}
-            <SegmentSceneStrip
-              projectId={projectId}
-              clipPreviewNonce={clipPreviewNonce}
-              segments={draft.segments}
-              segmentHealth={projectQuery.data?.segmentRenderHealth}
-              selectedId={selectedSegmentId}
-              onSelect={setSelectedSegmentId}
-              onAdd={() => addSegmentMutation.mutate()}
-              addDisabled={addSegmentMutation.isPending}
-              fps={draft.chaining.fps}
-              defaultClipSeconds={draft.defaults.clip_duration_seconds}
-              onRequestUploadClip={(segmentIndex) => {
-                pendingUploadClipIndex.current = segmentIndex;
-                clipFileInputRef.current?.click();
-              }}
-              onRequestExtendFromPrevious={(segmentId) =>
-                extendFromPreviousMutation.mutate(segmentId)
-              }
-              extendBusy={extendFromPreviousMutation.isPending}
-              uploadBusy={clipImageMutation.isPending}
-              onRemoveSegment={(segmentId) =>
-                deleteSegmentMutation.mutate(segmentId)
-              }
-              removeDisabled={deleteSegmentMutation.isPending}
-            />
-            <div className="flex justify-end">
-              <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                onClick={() => setScriptSheetOpen(true)}
-                disabled={draft.segments.length === 0}
-              >
-                <ScrollText className="mr-2 size-4" aria-hidden />
-                Whole script
-              </Button>
-            </div>
           </div>
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            onClick={() => setScriptSheetOpen(true)}
+            disabled={draft.segments.length === 0}
+          >
+            <ScrollText className="mr-2 size-4" aria-hidden />
+            Whole script
+          </Button>
+        </div>
+        <SegmentSceneStrip
+          projectId={projectId}
+          clipPreviewNonce={clipPreviewNonce}
+          project={draft}
+          segmentHealth={projectQuery.data?.segmentRenderHealth}
+          selectedId={selectedSegmentId}
+          onSelect={setSelectedSegmentId}
+          onAdd={() => addSegmentMutation.mutate()}
+          addDisabled={addSegmentMutation.isPending}
+          fps={draft.chaining.fps}
+          defaultClipSeconds={draft.defaults.clip_duration_seconds}
+          onRequestUploadClip={(segmentIndex) => {
+            pendingUploadClipIndex.current = segmentIndex;
+            clipFileInputRef.current?.click();
+          }}
+          onRequestExtendFromPrevious={(segmentId) =>
+            extendFromPreviousMutation.mutate(segmentId)
+          }
+          extendBusy={extendFromPreviousMutation.isPending}
+          uploadBusy={clipImageMutation.isPending}
+          onRemoveSegment={(segmentId) =>
+            deleteSegmentMutation.mutate(segmentId)
+          }
+          removeDisabled={deleteSegmentMutation.isPending}
+          autoCenterSelected
+        />
+      </div>
+
+      <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_minmax(20rem,26rem)]">
+        <div className="min-w-0 space-y-4">
+          {dirty ? (
+            <p className="text-muted-foreground text-xs">
+              Unsaved changes (continuity markers reflect the last saved project).
+            </p>
+          ) : null}
 
           {selectedSeg && selectedIndex >= 0 ? (
             <Card>
@@ -1046,112 +1082,143 @@ export function ComposerPanel({ projectId }: { projectId: string }) {
           )}
         </div>
 
-        {/* Preview */}
-        <div className="space-y-4">
+        <div className="space-y-4 lg:sticky lg:top-24 lg:self-start">
           <Card>
             <CardHeader className="pb-3">
-              <CardTitle className="text-base">Timeline render</CardTitle>
+              <CardTitle className="text-base">Render</CardTitle>
               <p className="text-muted-foreground text-xs leading-snug">
-                Pick a clip on the timeline, then render just that clip, through the next scene break
-                (end of the chained group), or onward. Earlier clips reuse saved timeline outputs when
-                possible so chaining stays consistent.
+                {selectedIndex >= 0
+                  ? `Selected: clip ${selectedIndex + 1}. Earlier clips reuse saved
+                  timeline outputs so chaining stays consistent.`
+                  : "Pick a clip on the timeline above to render."}
               </p>
             </CardHeader>
             <CardContent className="space-y-4">
-              <div className="flex flex-col gap-2">
-                {firstStaleClipIndex !== null ? (
+              {staleSummary.firstIndex !== null ? (
+                <div className="flex items-center justify-between gap-2 rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-xs">
+                  <span className="font-medium text-amber-900">
+                    {staleSummary.count} clip{staleSummary.count === 1 ? "" : "s"} stale
+                  </span>
                   <Button
                     type="button"
                     variant="outline"
                     size="sm"
-                    className="w-full justify-center sm:w-auto sm:self-start"
-                    disabled={
-                      timelineRenderMutation.isPending || draft.segments.length === 0
-                    }
+                    className="border-amber-400 bg-white text-amber-900 hover:bg-amber-100"
+                    disabled={timelineRenderMutation.isPending}
                     onClick={() =>
                       timelineRenderMutation.mutate({
-                        from_segment_index: firstStaleClipIndex,
+                        from_segment_index: staleSummary.firstIndex!,
                         to_segment_index_exclusive: chainGroupEndExclusive(
                           draft,
-                          firstStaleClipIndex,
+                          staleSummary.firstIndex!,
                         ),
                       })
                     }
                   >
-                    Render next stale block (clip {firstStaleClipIndex + 1})
+                    Render stale block (clip {staleSummary.firstIndex + 1})
                   </Button>
-                ) : null}
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="sm"
-                  className="w-full justify-center sm:w-auto sm:self-start"
-                  disabled={
-                    timelineRenderMutation.isPending ||
-                    draft.segments.length === 0 ||
-                    selectedIndex < 0
-                  }
-                  onClick={() =>
-                    timelineRenderMutation.mutate({
-                      from_segment_index: selectedIndex,
-                      to_segment_index_exclusive: selectedIndex + 1,
-                    })
-                  }
-                >
-                  Render this clip only
-                </Button>
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="sm"
-                  className="w-full justify-center sm:w-auto sm:self-start"
-                  disabled={
-                    timelineRenderMutation.isPending ||
-                    draft.segments.length === 0 ||
-                    selectedIndex < 0
-                  }
-                  onClick={() =>
-                    timelineRenderMutation.mutate({
-                      from_segment_index: selectedIndex,
-                      to_segment_index_exclusive: chainGroupEndExclusive(
-                        draft,
-                        selectedIndex,
-                      ),
-                    })
-                  }
-                >
-                  Render through scene boundary
-                </Button>
-                <Button
-                  type="button"
-                  variant="secondary"
-                  size="sm"
-                  className="w-full justify-center sm:w-auto sm:self-start"
-                  disabled={
-                    timelineRenderMutation.isPending ||
-                    draft.segments.length === 0 ||
-                    selectedIndex < 0
-                  }
-                  onClick={() =>
-                    timelineRenderMutation.mutate({
-                      from_segment_index: selectedIndex,
-                    })
-                  }
-                >
-                  Render from here to end
-                </Button>
-                <Button
-                  type="button"
-                  disabled={
-                    timelineRenderMutation.isPending || draft.segments.length === 0
-                  }
-                  className="w-full justify-center sm:w-auto sm:self-start"
-                  onClick={() =>
-                    timelineRenderMutation.mutate({ from_segment_index: 0 })
-                  }
-                >
-                  Render entire timeline
-                </Button>
+                </div>
+              ) : null}
+
+              <div className="grid gap-2">
+                <div className="flex gap-2">
+                  <Button
+                    type="button"
+                    className="flex-1 justify-center"
+                    disabled={
+                      timelineRenderMutation.isPending ||
+                      draft.segments.length === 0 ||
+                      selectedIndex < 0
+                    }
+                    onClick={() =>
+                      timelineRenderMutation.mutate({
+                        from_segment_index: selectedIndex,
+                        to_segment_index_exclusive: selectedIndex + 1,
+                      })
+                    }
+                  >
+                    <PlayCircle className="mr-1.5 size-4" aria-hidden />
+                    Render this clip
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="secondary"
+                    className="flex-1 justify-center"
+                    disabled={
+                      timelineRenderMutation.isPending ||
+                      draft.segments.length === 0 ||
+                      selectedIndex < 0
+                    }
+                    onClick={() =>
+                      timelineRenderMutation.mutate({
+                        from_segment_index: selectedIndex,
+                        to_segment_index_exclusive: chainGroupEndExclusive(
+                          draft,
+                          selectedIndex,
+                        ),
+                      })
+                    }
+                  >
+                    <Film className="mr-1.5 size-4" aria-hidden />
+                    Full scene
+                  </Button>
+                </div>
+                <DropdownMenu>
+                  <DropdownMenuTrigger
+                    render={
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        className="w-full justify-between"
+                        disabled={
+                          timelineRenderMutation.isPending ||
+                          draft.segments.length === 0
+                        }
+                      />
+                    }
+                  >
+                    <span>More render scopes</span>
+                    <ChevronDown className="size-4" aria-hidden />
+                  </DropdownMenuTrigger>
+                  <DropdownMenuContent align="end" className="w-64">
+                    <DropdownMenuLabel>Render scope</DropdownMenuLabel>
+                    <DropdownMenuItem
+                      disabled={selectedIndex < 0}
+                      onSelect={() =>
+                        timelineRenderMutation.mutate({
+                          from_segment_index: Math.max(0, selectedIndex),
+                        })
+                      }
+                    >
+                      From here to end
+                    </DropdownMenuItem>
+                    <DropdownMenuItem
+                      onSelect={() =>
+                        timelineRenderMutation.mutate({ from_segment_index: 0 })
+                      }
+                    >
+                      Entire timeline
+                    </DropdownMenuItem>
+                    {selectedIndex >= 0 ? (
+                      <>
+                        <DropdownMenuSeparator />
+                        <DropdownMenuItem
+                          onSelect={() =>
+                            timelineRenderMutation.mutate({
+                              from_segment_index: selectedIndex,
+                              to_segment_index_exclusive: selectedIndex + 1,
+                              assembly_ab_compare: true,
+                            })
+                          }
+                        >
+                          <Wand2 className="mr-2 size-4" aria-hidden />
+                          A/B compare assembly orders
+                        </DropdownMenuItem>
+                      </>
+                    ) : null}
+                  </DropdownMenuContent>
+                </DropdownMenu>
               </div>
 
               <Separator />
@@ -1296,45 +1363,52 @@ export function ComposerPanel({ projectId }: { projectId: string }) {
                 ) : null}
               </div>
 
-              <Separator />
-              <div className="flex flex-wrap gap-2">
-                {activeRunId ? (
-                  <>
-                    <Button
-                      variant="secondary"
-                      type="button"
-                      onClick={() =>
-                        fetch(`/api/projects/${projectId}/runs/${activeRunId}/resume`, {
-                          method: "POST",
-                        })}
-                    >
-                      Resume
-                    </Button>
-                    <Button
-                      variant="outline"
-                      type="button"
-                      onClick={() =>
-                        fetch(`/api/projects/${projectId}/runs/${activeRunId}/stop`, {
-                          method: "POST",
-                        })}
-                    >
-                      Stop
-                    </Button>
-                  </>
-                ) : null}
-              </div>
               {activeRunId ? (
-                <div className="text-muted-foreground space-y-1 text-xs">
-                  <p>
-                    <Link
-                      href={`/project/${projectId}/runs`}
-                      className="text-foreground font-medium underline"
-                    >
-                      Snapshots
-                    </Link>
-                    <span className="font-mono"> · {activeRunId}</span>
-                  </p>
-                </div>
+                <>
+                  <Separator />
+                  <div className="flex flex-wrap items-center justify-between gap-2 rounded-md border bg-muted/30 px-3 py-2">
+                    <div className="text-muted-foreground space-y-0.5 text-xs">
+                      <div className="text-foreground text-sm font-medium">
+                        Active run
+                      </div>
+                      <p className="font-mono leading-tight">
+                        <Link
+                          href={`/project/${projectId}/runs`}
+                          className="text-foreground underline"
+                        >
+                          Snapshots
+                        </Link>
+                        <span> · {activeRunId}</span>
+                      </p>
+                    </div>
+                    <div className="flex gap-2">
+                      <Button
+                        variant="secondary"
+                        size="sm"
+                        type="button"
+                        onClick={() =>
+                          fetch(`/api/projects/${projectId}/runs/${activeRunId}/resume`, {
+                            method: "POST",
+                          })}
+                      >
+                        <PlayCircle className="mr-1.5 size-4" aria-hidden />
+                        Resume
+                      </Button>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        type="button"
+                        onClick={() =>
+                          fetch(`/api/projects/${projectId}/runs/${activeRunId}/stop`, {
+                            method: "POST",
+                          })}
+                      >
+                        <StopCircle className="mr-1.5 size-4" aria-hidden />
+                        Stop
+                      </Button>
+                    </div>
+                  </div>
+                </>
               ) : null}
               {forgeRender ? <ForgeRunRenderStatus state={forgeRender} /> : null}
             </CardContent>
@@ -1343,13 +1417,10 @@ export function ComposerPanel({ projectId }: { projectId: string }) {
           <Card>
             <CardHeader className="flex flex-row flex-wrap items-start justify-between gap-2 pb-3">
               <div className="min-w-0 flex-1 space-y-1">
-                <CardTitle className="text-base">Timeline playback</CardTitle>
+                <CardTitle className="text-base">Player</CardTitle>
                 <p className="text-muted-foreground max-w-prose text-xs leading-snug">
-                  <strong className="font-medium text-foreground">Latest clip</strong> reads your saved
-                  timeline file for the last finished clip (or the clip you select).{" "}
-                  <strong className="font-medium text-foreground">Merged timeline</strong> plays{" "}
-                  <span className="font-mono">final.mp4</span> from snapshots; after renders that finish
-                  multiple clips, merged opens automatically.
+                  Anchors to the most recently rendered clip; switches to the merged
+                  timeline after multi-clip renders finish.
                 </p>
               </div>
               <Button type="button" variant="outline" size="sm" onClick={togglePreviewMuted}>

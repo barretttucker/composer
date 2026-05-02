@@ -298,12 +298,24 @@ export function SegmentStructuredPromptFields({
                 if (v === "chained") {
                   s.extend_from_previous = true;
                   s.seed_frame_rel = undefined;
+                  s.seed_from_segment_id = undefined;
                 }
                 if (v === "fresh") {
                   s.extend_from_previous = false;
+                  s.seed_from_segment_id = undefined;
                 }
                 if (v === "touched_up") {
                   s.extend_from_previous = true;
+                  s.seed_from_segment_id = undefined;
+                }
+                if (v === "chained_from") {
+                  s.extend_from_previous = true;
+                  s.seed_frame_rel = undefined;
+                  // Default to the immediate previous clip when first toggled.
+                  if (!s.seed_from_segment_id) {
+                    const prev = p.segments[selectedIndex - 1];
+                    s.seed_from_segment_id = prev?.id;
+                  }
                 }
                 return p;
               })}
@@ -312,11 +324,48 @@ export function SegmentStructuredPromptFields({
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
-              <SelectItem value="chained">Chained (previous last frame)</SelectItem>
+              <SelectItem value="chained">Chained (previous clip)</SelectItem>
+              <SelectItem value="chained_from">Chained from earlier clip</SelectItem>
               <SelectItem value="fresh">Fresh (custom upload)</SelectItem>
               <SelectItem value="touched_up">Touched-up (replace seed PNG)</SelectItem>
             </SelectContent>
           </Select>
+          {selectedSeg.seed_frame_source === "chained_from" ? (
+            <div className="mt-2 space-y-1">
+              <Label className="text-xs">Source clip</Label>
+              <Select
+                value={selectedSeg.seed_from_segment_id ?? ""}
+                onValueChange={(v) =>
+                  patchDraft((p) => {
+                    const s = p.segments.find((x) => x.id === selectedSeg.id);
+                    if (!s) return p;
+                    const nextId = typeof v === "string" && v.length > 0 ? v : undefined;
+                    s.seed_from_segment_id = nextId;
+                    s.seed_frame_rel = undefined;
+                    return p;
+                  })}
+              >
+                <SelectTrigger>
+                  <SelectValue placeholder="Pick an earlier clip" />
+                </SelectTrigger>
+                <SelectContent>
+                  {draft.segments.slice(0, selectedIndex).map((s, i) => {
+                    const promptSnippet = s.prompt?.trim().slice(0, 32) ?? "";
+                    const label = promptSnippet || `Clip ${i + 1}`;
+                    return (
+                      <SelectItem key={s.id} value={s.id}>
+                        {`Clip ${i + 1} - ${label}`}
+                      </SelectItem>
+                    );
+                  })}
+                </SelectContent>
+              </Select>
+              <p className="text-muted-foreground text-[11px] leading-snug">
+                Uses the picked clip&apos;s last frame as the seed for this clip&apos;s
+                render. Re-rendering the source clip cascades to this one.
+              </p>
+            </div>
+          ) : null}
           {selectedSeg.seed_frame_source === "touched_up" ? (
             <>
               <input

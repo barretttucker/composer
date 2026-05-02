@@ -364,6 +364,7 @@ async function runLoop(args: {
         project,
         segmentIndex: i,
         chainCurrentAbs: currentInputPath,
+        runFolderAbs: baseFolder,
       });
       publishSegmentCanonicalArtifacts({
         projectId,
@@ -446,6 +447,7 @@ async function runLoop(args: {
           project,
           segmentIndex: i,
           chainCurrentAbs: currentInputPath,
+          runFolderAbs: baseFolder,
         });
         const initB64Ab = fs.readFileSync(resolvedInitAb).toString("base64");
 
@@ -648,6 +650,7 @@ async function runLoop(args: {
         project,
         segmentIndex: i,
         chainCurrentAbs: currentInputPath,
+        runFolderAbs: baseFolder,
       });
       const initB64 = fs.readFileSync(resolvedInit).toString("base64");
       const seedRelUsed = seedFrameRelUsedForSegment(project, i, resolvedInit);
@@ -972,14 +975,18 @@ export function pickAssemblyAbVariant(params: {
 
   let chainCurrentAbs = startFramePath(projectId);
   if (segIndex > 0) {
+    // Default fallback: the immediate previous clip. The resolver may instead pick a
+    // chained_from source, which is fine because resolveSegmentInitImageAbs handles
+    // that case (preferring the in-run copy when present).
     const prev = project.segments[segIndex - 1]!;
     const canon = readCanonicalSegmentArtifacts(projectId, prev.id);
-    if (!canon) {
+    if (canon) {
+      chainCurrentAbs = canon.lastFrameAbs;
+    } else if (segment.seed_frame_source !== "chained_from") {
       throw new Error(
         "Cannot resolve seed frame bookkeeping: previous segment has no canonical last frame.",
       );
     }
-    chainCurrentAbs = canon.lastFrameAbs;
   }
 
   const resolvedInit = resolveSegmentInitImageAbs({
@@ -987,6 +994,7 @@ export function pickAssemblyAbVariant(params: {
     project,
     segmentIndex: segIndex,
     chainCurrentAbs,
+    runFolderAbs: baseFolder,
   });
   const seedRelUsed = seedFrameRelUsedForSegment(project, segIndex, resolvedInit);
   const neg = assembleNegativePrompt(segment, project);

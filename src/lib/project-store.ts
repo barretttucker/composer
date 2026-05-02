@@ -96,17 +96,29 @@ export function seedFrameRelUsedForSegment(
   return rel;
 }
 
+/** Inline path computation to avoid run-store import cycle. */
+function runLocalLastFrameAbs(
+  runFolderAbs: string,
+  sourceSegmentIndex: number,
+): string {
+  const pad = String(sourceSegmentIndex).padStart(2, "0");
+  return path.join(runFolderAbs, "segments", `seg_${pad}_lastframe.png`);
+}
+
 /**
  * Resolve absolute path to the PNG Forge should use as init for this segment.
  * `chainCurrentAbs` is the previous clip last-frame path when chaining (may be stale until prior renders).
+ * `runFolderAbs` (when in a run context) lets `chained_from` prefer the in-run copy of a chain source's
+ * lastframe over its canonical version, so AB rendering and just-finished re-renders feed forward correctly.
  */
 export function resolveSegmentInitImageAbs(params: {
   projectId: string;
   project: Project;
   segmentIndex: number;
   chainCurrentAbs: string;
+  runFolderAbs?: string;
 }): string {
-  const { projectId, project, segmentIndex, chainCurrentAbs } = params;
+  const { projectId, project, segmentIndex, chainCurrentAbs, runFolderAbs } = params;
   const root = projectRoot(projectId);
   const seg = project.segments[segmentIndex];
   if (segmentIndex === 0) {
@@ -126,6 +138,22 @@ export function resolveSegmentInitImageAbs(params: {
     const custom = customSegmentInitAbsolute(projectId, seg.id);
     if (fs.existsSync(custom)) return custom;
     return startFramePath(projectId);
+  }
+
+  if (src === "chained_from") {
+    const tid = seg.seed_from_segment_id?.trim();
+    if (tid) {
+      const sourceIdx = project.segments.findIndex((s) => s.id === tid);
+      if (sourceIdx >= 0 && sourceIdx < segmentIndex) {
+        if (runFolderAbs) {
+          const inRun = runLocalLastFrameAbs(runFolderAbs, sourceIdx);
+          if (fs.existsSync(inRun)) return inRun;
+        }
+        const canon = canonicalSegmentLastFrame(projectId, tid);
+        if (fs.existsSync(canon)) return canon;
+      }
+    }
+    return chainCurrentAbs;
   }
 
   if (src === "touched_up") {
@@ -151,29 +179,55 @@ export function wireNextSegmentSeedAfterPublish(
 ): void {
   const p = loadProject(projectId);
   if (completedSegmentIndex >= p.segments.length - 1) return;
-  const next = p.segments[completedSegmentIndex + 1];
-  if (next.seed_frame_source === "fresh") return;
+  const completed = p.segments[completedSegmentIndex];
+  let dirty = false;
 
-  if (next.seed_frame_source === "touched_up") {
-    if (next.seed_frame_rel == null || String(next.seed_frame_rel).trim() === "") {
-      const rel = touchedUpSeedRel(next.id);
-      const src = path.join(projectRoot(projectId), ...completedLastFrameRelPosix.split("/"));
-      const dest = path.join(projectRoot(projectId), ...rel.split("/"));
-      ensureDir(path.dirname(dest));
-      if (fs.existsSync(src)) fs.copyFileSync(src, dest);
-      next.seed_frame_rel = rel;
-      p.updated_at = new Date().toISOString();
-      saveProject(p);
+  // 1) Wire the immediate next segment when it consumes the previous clip.
+  const next = p.segments[completedSegmentIndex + 1];
+  if (next.seed_frame_source !== "fresh") {
+    if (next.seed_frame_source === "touched_up") {
+      if (next.seed_frame_rel == null || String(next.seed_frame_rel).trim() === "") {
+        const rel = touchedUpSeedRel(next.id);
+        const src = path.join(
+          projectRoot(projectId),
+          ...completedLastFrameRelPosix.split("/"),
+        );
+        const dest = path.join(projectRoot(projectId), ...rel.split("/"));
+        ensureDir(path.dirname(dest));
+        if (fs.existsSync(src)) fs.copyFileSync(src, dest);
+        next.seed_frame_rel = rel;
+        dirty = true;
+      }
+    } else if (
+      next.seed_frame_source === "chained" ||
+      next.seed_frame_source == null
+    ) {
+      if (!next.seed_frame_rel || String(next.seed_frame_rel).trim() === "") {
+        next.seed_frame_rel = completedLastFrameRelPosix.replace(/\\/g, "/");
+        dirty = true;
+      }
     }
-    return;
   }
 
-  if (next.seed_frame_source === "chained" || next.seed_frame_source == null) {
-    if (!next.seed_frame_rel || String(next.seed_frame_rel).trim() === "") {
-      next.seed_frame_rel = completedLastFrameRelPosix.replace(/\\/g, "/");
-      p.updated_at = new Date().toISOString();
-      saveProject(p);
+  // 2) Wire any later chained_from segments that point at the completed clip.
+  // We bake the canonical last_frame relative path so the resolver can fall back to it
+  // when no run-local copy exists yet (e.g. UI reads outside an active run).
+  const canonRel = path.posix
+    .join("segment_outputs", completed.id, "last_frame.png")
+    .replace(/\\/g, "/");
+  for (let j = completedSegmentIndex + 1; j < p.segments.length; j++) {
+    const s = p.segments[j]!;
+    if (s.seed_frame_source !== "chained_from") continue;
+    if (s.seed_from_segment_id !== completed.id) continue;
+    if (!s.seed_frame_rel || String(s.seed_frame_rel).trim() === "") {
+      s.seed_frame_rel = canonRel;
+      dirty = true;
     }
+  }
+
+  if (dirty) {
+    p.updated_at = new Date().toISOString();
+    saveProject(p);
   }
 }
 

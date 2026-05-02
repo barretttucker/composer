@@ -90,7 +90,16 @@ export const styleBlockSchema = z.object({
 
 export type StyleBlock = z.infer<typeof styleBlockSchema>;
 
-export const seedFrameSourceSchema = z.enum(["chained", "fresh", "touched_up"]);
+export const seedFrameSourceSchema = z.enum([
+  /** Use the previous clip's chained last frame (default for clips after the first). */
+  "chained",
+  /** Use a specific earlier clip's last frame, identified by `seed_from_segment_id`. */
+  "chained_from",
+  /** Custom uploaded init PNG (per-segment override). */
+  "fresh",
+  /** Chain from previous, but allow the user to manually retouch the seed PNG. */
+  "touched_up",
+]);
 export type SeedFrameSource = z.infer<typeof seedFrameSourceSchema>;
 
 export const ASSEMBLY_FIELDS = [
@@ -231,6 +240,8 @@ export const segmentSchema = z.object({
   seed_frame_source: seedFrameSourceSchema.optional(),
   /** Project-root-relative path to PNG seed (fresh / touched_up / explicit). */
   seed_frame_rel: z.string().optional(),
+  /** When seed_frame_source = "chained_from": the source segment's stable id. */
+  seed_from_segment_id: z.string().optional(),
   published_generation: publishedGenerationSchema.optional(),
 });
 
@@ -256,9 +267,44 @@ export function segmentUsesStructuredAssembly(project: Project, segment: Segment
 export function segmentUsesChainInit(segment: Segment, segmentIndex: number): boolean {
   if (segmentIndex === 0) return true;
   if (segment.seed_frame_source === "fresh") return false;
-  if (segment.seed_frame_source === "chained" || segment.seed_frame_source === "touched_up")
+  if (
+    segment.seed_frame_source === "chained" ||
+    segment.seed_frame_source === "touched_up" ||
+    segment.seed_frame_source === "chained_from"
+  )
     return true;
   return segment.extend_from_previous !== false;
+}
+
+/**
+ * Index of the segment whose last frame seeds this segment, or null when there is no
+ * upstream chain (start frame, or fresh upload). Falls back to segmentIndex - 1 when a
+ * chained_from reference is missing or stale.
+ */
+export function segmentChainSourceIndex(
+  project: Pick<Project, "segments">,
+  segmentIndex: number,
+): number | null {
+  if (segmentIndex <= 0) return null;
+  const segment = project.segments[segmentIndex];
+  if (!segment) return null;
+  if (segment.seed_frame_source === "fresh") return null;
+  if (segment.seed_frame_source === "chained_from") {
+    const tid = segment.seed_from_segment_id?.trim();
+    if (tid) {
+      const idx = project.segments.findIndex((s) => s.id === tid);
+      if (idx >= 0 && idx < segmentIndex) return idx;
+    }
+    return segmentIndex - 1;
+  }
+  if (
+    segment.seed_frame_source === "chained" ||
+    segment.seed_frame_source === "touched_up"
+  ) {
+    return segmentIndex - 1;
+  }
+  if (segment.extend_from_previous === false) return null;
+  return segmentIndex - 1;
 }
 
 export const chainingSchema = z
@@ -356,6 +402,35 @@ export const projectSchema = z
         path: ["default_style_block_id"],
       });
     }
+    const segmentIndexById = new Map(proj.segments.map((s, i) => [s.id, i]));
+    proj.segments.forEach((seg, i) => {
+      if (seg.seed_frame_source !== "chained_from") return;
+      const tid = seg.seed_from_segment_id?.trim();
+      if (!tid) {
+        ctx.addIssue({
+          code: "custom",
+          message: `segment[${i}] uses chained_from but has no seed_from_segment_id`,
+          path: ["segments", i, "seed_from_segment_id"],
+        });
+        return;
+      }
+      const sourceIdx = segmentIndexById.get(tid);
+      if (sourceIdx === undefined) {
+        ctx.addIssue({
+          code: "custom",
+          message: `segment[${i}] seed_from_segment_id references missing segment`,
+          path: ["segments", i, "seed_from_segment_id"],
+        });
+        return;
+      }
+      if (sourceIdx >= i) {
+        ctx.addIssue({
+          code: "custom",
+          message: `segment[${i}] seed_from_segment_id must reference an earlier segment`,
+          path: ["segments", i, "seed_from_segment_id"],
+        });
+      }
+    });
   });
 
 export type Project = z.infer<typeof projectSchema>;

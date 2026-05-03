@@ -2,22 +2,39 @@ import { z } from "zod";
 
 import { PROJECT_FOLDER_KEY_RE } from "@/lib/project-slug";
 
-export const chainHygieneSchema = z.object({
-  enabled: z.boolean(),
-  /** Negative offset from last frame: -1 = last frame, -3 ≈ third-to-last (recommended). */
-  frame_offset: z.number().int().min(-10).max(-1),
-  /** Forge `extra-single-image` 2× upscale then Lanczos downscale back to chain frame size. */
-  sharpen: z.boolean(),
-  /** Forge upscaler name (see /sdapi/v1/upscalers), e.g. SwinIR_4x or SwinIR 4x. */
-  upscaler: z.string(),
-});
+/**
+ * Chain seed frame settings (always applied between chained clips). The legacy
+ * "extract last frame as JPEG-compressed PNG" path was removed; we always
+ * extract an earlier frame as an uncompressed PNG, optionally sharpened via a
+ * Forge upscaler ×2 + Lanczos downscale.
+ *
+ * Zod preprocess strips the legacy `enabled` field so old project.json files
+ * still load cleanly.
+ */
+export const chainHygieneSchema = z.preprocess(
+  (raw) => {
+    if (raw && typeof raw === "object" && !Array.isArray(raw)) {
+      const { enabled: _ignored, ...rest } = raw as Record<string, unknown>;
+      void _ignored;
+      return rest;
+    }
+    return raw;
+  },
+  z.object({
+    /** Negative offset from last frame: -1 = last frame, -3 ≈ third-to-last (default). */
+    frame_offset: z.number().int().min(-10).max(-1),
+    /** Forge `extra-single-image` 2× upscale then Lanczos downscale back to chain frame size. */
+    sharpen: z.boolean(),
+    /** Forge upscaler name (see /sdapi/v1/upscalers), e.g. SwinIR_4x or SwinIR 4x. */
+    upscaler: z.string(),
+  }),
+);
 
 export type ChainHygieneParams = z.infer<typeof chainHygieneSchema>;
 
 export const DEFAULT_CHAIN_HYGIENE: ChainHygieneParams = {
-  enabled: false,
   frame_offset: -3,
-  sharpen: false,
+  sharpen: true,
   upscaler: "SwinIR_4x",
 };
 
@@ -309,14 +326,13 @@ export function segmentChainSourceIndex(
 
 export const chainingSchema = z
   .object({
-    frame_offset: z.number(),
     blend_frames: z.number(),
     fps: z.number(),
-    /** Legacy — stripped on parse. */
+    /** Legacy fields — stripped on parse so old projects load cleanly. */
+    frame_offset: z.number().optional(),
     target_total_seconds: z.number().optional(),
   })
-  .transform(({ frame_offset, blend_frames, fps }) => ({
-    frame_offset,
+  .transform(({ blend_frames, fps }) => ({
     blend_frames,
     fps,
   }));

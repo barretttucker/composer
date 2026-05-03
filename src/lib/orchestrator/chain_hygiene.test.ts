@@ -37,7 +37,6 @@ describe("applyChainHygiene", () => {
     ]);
 
     const cfg: GenerationParams["chain_hygiene"] = {
-      enabled: true,
       frame_offset: -3,
       sharpen: false,
       upscaler: "SwinIR_4x",
@@ -91,7 +90,6 @@ describe("applyChainHygiene", () => {
     } satisfies Pick<ForgeNeoClient, "extraSingleImage">;
 
     const cfg: GenerationParams["chain_hygiene"] = {
-      enabled: true,
       frame_offset: -3,
       sharpen: true,
       upscaler: "SwinIR_4x",
@@ -124,7 +122,6 @@ describe("applyChainHygiene", () => {
     ]);
 
     const cfg: GenerationParams["chain_hygiene"] = {
-      enabled: true,
       frame_offset: -1,
       sharpen: false,
       upscaler: "SwinIR_4x",

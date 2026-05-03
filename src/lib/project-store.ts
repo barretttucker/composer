@@ -96,29 +96,21 @@ export function seedFrameRelUsedForSegment(
   return rel;
 }
 
-/** Inline path computation to avoid run-store import cycle. */
-function runLocalLastFrameAbs(
-  runFolderAbs: string,
-  sourceSegmentIndex: number,
-): string {
-  const pad = String(sourceSegmentIndex).padStart(2, "0");
-  return path.join(runFolderAbs, "segments", `seg_${pad}_lastframe.png`);
-}
-
 /**
  * Resolve absolute path to the PNG Forge should use as init for this segment.
- * `chainCurrentAbs` is the previous clip last-frame path when chaining (may be stale until prior renders).
- * `runFolderAbs` (when in a run context) lets `chained_from` prefer the in-run copy of a chain source's
- * lastframe over its canonical version, so AB rendering and just-finished re-renders feed forward correctly.
+ * `chainCurrentAbs` is the previous clip last-frame path when chaining (used as a
+ * last-resort fallback when chained_from cannot be resolved canonically).
+ *
+ * Renders now promote outputs into canonical immediately, so the resolver always
+ * reads from canonical for chained_from sources without needing a run-folder peek.
  */
 export function resolveSegmentInitImageAbs(params: {
   projectId: string;
   project: Project;
   segmentIndex: number;
   chainCurrentAbs: string;
-  runFolderAbs?: string;
 }): string {
-  const { projectId, project, segmentIndex, chainCurrentAbs, runFolderAbs } = params;
+  const { projectId, project, segmentIndex, chainCurrentAbs } = params;
   const root = projectRoot(projectId);
   const seg = project.segments[segmentIndex];
   if (segmentIndex === 0) {
@@ -143,15 +135,8 @@ export function resolveSegmentInitImageAbs(params: {
   if (src === "chained_from") {
     const tid = seg.seed_from_segment_id?.trim();
     if (tid) {
-      const sourceIdx = project.segments.findIndex((s) => s.id === tid);
-      if (sourceIdx >= 0 && sourceIdx < segmentIndex) {
-        if (runFolderAbs) {
-          const inRun = runLocalLastFrameAbs(runFolderAbs, sourceIdx);
-          if (fs.existsSync(inRun)) return inRun;
-        }
-        const canon = canonicalSegmentLastFrame(projectId, tid);
-        if (fs.existsSync(canon)) return canon;
-      }
+      const canon = canonicalSegmentLastFrame(projectId, tid);
+      if (fs.existsSync(canon)) return canon;
     }
     return chainCurrentAbs;
   }
@@ -365,18 +350,33 @@ export function canonicalSegmentGenerationJsonRel(segmentId: string): string {
   return path.posix.join("segment_outputs", segmentId, "generation.json");
 }
 
-export function publishSegmentCanonicalArtifacts(params: {
+/**
+ * Atomically move a source file into a destination path. Tries `rename` first
+ * (fast, atomic on the same filesystem); falls back to copy + unlink across
+ * filesystem boundaries (EXDEV).
+ */
+export function promoteFileAtomic(srcAbs: string, destAbs: string): void {
+  ensureDir(path.dirname(destAbs));
+  try {
+    fs.renameSync(srcAbs, destAbs);
+  } catch (err) {
+    const e = err as NodeJS.ErrnoException;
+    if (e.code !== "EXDEV") throw err;
+    fs.copyFileSync(srcAbs, destAbs);
+    fs.unlinkSync(srcAbs);
+  }
+}
+
+/**
+ * Copy mp4 + last frame into canonical. Used by the AB pick path which needs to
+ * preserve the source (the unchosen variant survives in the run folder until it
+ * is explicitly cleaned). Renders use `promoteFileAtomic` directly.
+ */
+export function copySegmentArtifactsToCanonical(params: {
   projectId: string;
   segmentId: string;
   mp4SourceAbs: string;
   lastFrameSourceAbs: string;
-  fingerprint: string;
-  published?: {
-    assembled_prompt: string;
-    assembled_negative_prompt: string;
-    merged_generation_params: GenerationParams;
-    seed_frame_rel_used: string;
-  };
 }): void {
   const dir = segmentArtifactsDir(params.projectId, params.segmentId);
   ensureDir(dir);
@@ -388,6 +388,31 @@ export function publishSegmentCanonicalArtifacts(params: {
     params.lastFrameSourceAbs,
     canonicalSegmentLastFrame(params.projectId, params.segmentId),
   );
+}
+
+/**
+ * Records the render result for a segment whose mp4 + last frame are already in
+ * place under `segment_outputs/<segId>/`. Writes the `generation.json` sidecar
+ * and updates `project.json` (fingerprint + published_generation).
+ *
+ * The orchestrator promotes its render outputs straight into canonical (via
+ * `promoteFileAtomic`) and then calls this to record metadata. The AB pick
+ * path uses `copySegmentArtifactsToCanonical` first because it must preserve
+ * the source variant in the run folder.
+ */
+export function publishSegmentMetadata(params: {
+  projectId: string;
+  segmentId: string;
+  fingerprint: string;
+  published?: {
+    assembled_prompt: string;
+    assembled_negative_prompt: string;
+    merged_generation_params: GenerationParams;
+    seed_frame_rel_used: string;
+  };
+}): void {
+  const dir = segmentArtifactsDir(params.projectId, params.segmentId);
+  ensureDir(dir);
   const clipRel = path.posix.join("segment_outputs", params.segmentId, "clip.mp4");
   const lfRel = path.posix.join("segment_outputs", params.segmentId, "last_frame.png");
   const now = new Date().toISOString();
@@ -471,7 +496,6 @@ export function defaultGenerationParams(): Project["defaults"] {
 
 export function defaultChaining(): Project["chaining"] {
   return chainingSchema.parse({
-    frame_offset: -1,
     blend_frames: 0,
     fps: 16,
   });
@@ -575,9 +599,71 @@ export function touchProjectUpdated(projectId: string): void {
   saveProject(p);
 }
 
-export function addSegment(projectId: string, prompt: string): Segment {
+export type AddSegmentOptions = {
+  /**
+   * Seed mode for the new clip:
+   *   - "extend"    chain from the previous clip (default; same as today)
+   *   - "chain_from" chain from a specific earlier clip by stable id
+   *   - "fresh"     start from a user-supplied init PNG (clears motion_in)
+   *
+   * The very first segment is always treated as "extend" (which for index 0 means seed
+   * from the project start frame).
+   */
+  mode?: "extend" | "chain_from" | "fresh";
+  /** Required when mode === "chain_from": the source segment's stable id. */
+  fromSegmentId?: string;
+};
+
+/**
+ * Fields copied from a source clip to a newly-extended/chain-from clip so the
+ * user's structured context (location, characters, beat, camera intent, style,
+ * length, per-clip overrides) carries over by default. The user can still edit
+ * any of these on the new clip after creation.
+ *
+ * Deliberately NOT inherited:
+ *  - id / index            (identity)
+ *  - prompt                (caller passes a fresh prompt seed)
+ *  - pause_for_review / locked  (per-clip review flags reset)
+ *  - last_built_fingerprint / published_generation  (per-render bookkeeping)
+ *  - seed_frame_source / seed_frame_rel / seed_from_segment_id / extend_from_previous
+ *                          (the new clip's seed mode is decided by `mode`)
+ *  - motion_out            (clip-end label is per clip; new clip's motion_in
+ *                          is already filled from source.motion_out below)
+ *  - motion_in             (set explicitly from source.motion_out below)
+ */
+function inheritCarryOverFields(src: Segment, dest: Segment): void {
+  if (src.duration_seconds !== undefined) dest.duration_seconds = src.duration_seconds;
+  if (src.negative_prompt !== undefined) dest.negative_prompt = src.negative_prompt;
+  if (src.location_id !== undefined) dest.location_id = src.location_id;
+  if (src.active_characters !== undefined && src.active_characters.length > 0) {
+    dest.active_characters = src.active_characters.map((a) => ({ ...a }));
+  }
+  if (src.beat !== undefined) dest.beat = src.beat;
+  if (src.camera_intent !== undefined) dest.camera_intent = src.camera_intent;
+  if (src.style_block_id_override !== undefined) {
+    dest.style_block_id_override = src.style_block_id_override;
+  }
+  if (src.interaction !== undefined) dest.interaction = src.interaction;
+  dest.descriptor_mode = src.descriptor_mode;
+  if (src.assembly_override !== undefined) dest.assembly_override = src.assembly_override;
+  if (src.assembly_order_custom !== undefined) {
+    dest.assembly_order_custom = [...src.assembly_order_custom];
+  }
+  if (src.params_override !== undefined) {
+    dest.params_override = { ...src.params_override };
+  }
+}
+
+export function addSegment(
+  projectId: string,
+  prompt: string,
+  opts: AddSegmentOptions = {},
+): Segment {
   const p = loadProject(projectId);
   const prev = p.segments[p.segments.length - 1];
+  const isFirst = p.segments.length === 0;
+  const mode = isFirst ? "extend" : (opts.mode ?? "extend");
+
   const seg: Segment = {
     id: nanoid(),
     index: p.segments.length,
@@ -586,14 +672,38 @@ export function addSegment(projectId: string, prompt: string): Segment {
     locked: false,
     descriptor_mode: "full",
   };
-  if (p.segments.length > 0) {
-    seg.extend_from_previous = true;
-    seg.seed_frame_source = "chained";
-    const mo = prev?.motion_out?.trim() ?? "";
+
+  if (mode === "fresh") {
+    seg.seed_frame_source = "fresh";
+    seg.extend_from_previous = false;
+  } else if (mode === "chain_from") {
+    const tid = opts.fromSegmentId?.trim();
+    if (!tid) {
+      throw new Error("addSegment: mode 'chain_from' requires fromSegmentId");
+    }
+    const target = p.segments.find((s) => s.id === tid);
+    if (!target) {
+      throw new Error(`addSegment: source segment id '${tid}' not found`);
+    }
+    if (target.index >= seg.index) {
+      throw new Error("addSegment: chain_from source must be an earlier segment");
+    }
+    seg.seed_frame_source = "chained_from";
+    seg.seed_from_segment_id = tid;
+    seg.extend_from_previous = false;
+    inheritCarryOverFields(target, seg);
+    const mo = target.motion_out?.trim() ?? "";
     if (mo !== "") seg.motion_in = mo;
   } else {
     seg.seed_frame_source = "chained";
+    if (!isFirst) {
+      seg.extend_from_previous = true;
+      if (prev) inheritCarryOverFields(prev, seg);
+      const mo = prev?.motion_out?.trim() ?? "";
+      if (mo !== "") seg.motion_in = mo;
+    }
   }
+
   p.segments.push(seg);
   p.updated_at = new Date().toISOString();
   saveProject(p);
@@ -689,7 +799,6 @@ export function importPortableScript(
 
   const chaining = defaultChaining();
   const ch = parsed.chaining;
-  if (ch.frame_offset !== undefined) chaining.frame_offset = ch.frame_offset;
   if (ch.fps !== undefined) chaining.fps = ch.fps;
   if (ch.blend_frames !== undefined) chaining.blend_frames = ch.blend_frames;
 
@@ -782,7 +891,6 @@ export function exportPortableScript(projectId: string): PortableScript {
     input_image_filename: "start_frame.png",
     defaults: p.defaults,
     chaining: {
-      frame_offset: p.chaining.frame_offset,
       fps: p.chaining.fps,
       blend_frames: p.chaining.blend_frames,
     },

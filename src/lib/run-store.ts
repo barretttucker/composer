@@ -8,6 +8,7 @@ import {
   loadProject,
   runsDir,
   readCanonicalSegmentArtifacts,
+  canonicalSegmentLastFrame,
 } from "@/lib/project-store";
 import { assertValidRunFolderKey } from "@/lib/project-slug";
 import { runRecordSchema, type RunRecord, type SegmentRunState } from "@/lib/schemas/run";
@@ -66,12 +67,20 @@ export function saveRunRecord(projectId: string, record: RunRecord): void {
   );
 }
 
+/** Default policy: keep the 20 most recent unpinned runs, drop anything older than 7 days. */
+export const DEFAULT_KEEP_LATEST_UNPINNED = 20;
+export const DEFAULT_RUN_MAX_AGE_DAYS = 7;
+
 export function createRunSkeleton(params: {
   projectId: string;
   profileId: string;
   forgeBaseUrl: string;
   options?: RunRecord["options"];
 }): { record: RunRecord; folder: string } {
+  // Garbage-collect old jobs before creating the new one. Active and AB-pending
+  // jobs are always preserved.
+  pruneUnpinnedRuns(params.projectId);
+
   const runId = nextRunFolderName(params.projectId);
   const folder = runFolder(params.projectId, runId);
   ensureDir(folder);
@@ -100,17 +109,7 @@ export function createRunSkeleton(params: {
   return { record, folder };
 }
 
-export function segmentArtifactPathsInRun(i: number): {
-  mp4Rel: string;
-  lastFrameRel: string;
-} {
-  const pad = String(i).padStart(2, "0");
-  return {
-    mp4Rel: path.posix.join("segments", `seg_${pad}.mp4`),
-    lastFrameRel: path.posix.join("segments", `seg_${pad}_lastframe.png`),
-  };
-}
-
+/** AB pending-pick variants live under run-folder paths until the user picks one. */
 export function segmentArtifactPathsInRunAb(
   i: number,
   key: "a" | "b",
@@ -126,99 +125,50 @@ export function segmentArtifactPathsInRunAb(
   };
 }
 
-function patchSegmentRunState(
-  record: RunRecord,
-  segmentId: string,
-  patch: Partial<SegmentRunState>,
-): void {
-  const idx = record.segment_states.findIndex((s) => s.segment_id === segmentId);
-  if (idx === -1) return;
-  record.segment_states[idx] = {
-    ...record.segment_states[idx],
-    ...patch,
-    segment_id: segmentId,
-    index: record.segment_states[idx].index,
+/** Scratch render output (later promoted to canonical via rename). */
+export function segmentScratchPathsInRun(i: number): {
+  mp4Rel: string;
+  lastFrameRel: string;
+} {
+  const pad = String(i).padStart(2, "0");
+  return {
+    mp4Rel: path.posix.join("segments", `seg_${pad}.mp4`),
+    lastFrameRel: path.posix.join("segments", `seg_${pad}_lastframe.png`),
   };
 }
 
-/** Copies canonical or latest-run artifacts into this run for indices `[0, fromIndex)`. */
-export function hydrateRunPrefixFromPriorOutputs(params: {
+/**
+ * Validate that all priors `[0, fromIndex)` have canonical artifacts on disk
+ * and return the chain-input absolute path (canonical last frame of the prior
+ * segment). Replaces the legacy "copy everything into the run folder" hydrator
+ * — renders now read priors directly from canonical.
+ */
+export function validateCanonicalPriors(params: {
   projectId: string;
-  runId: string;
   fromIndex: number;
 }): { chainInputAbs: string } {
-  const { projectId, runId, fromIndex } = params;
+  const { projectId, fromIndex } = params;
   if (fromIndex <= 0) {
-    throw new Error("hydrateRunPrefixFromPriorOutputs requires fromIndex > 0");
+    throw new Error("validateCanonicalPriors requires fromIndex > 0");
   }
-
   const project = loadProject(projectId);
-  let record = loadRunRecord(projectId, runId);
-  const baseFolder = runFolder(projectId, runId);
-  ensureDir(segmentsDir(projectId, runId));
-
   if (fromIndex > project.segments.length) {
     throw new Error("from_segment_index out of range");
   }
-
   for (let i = 0; i < fromIndex; i++) {
     const segment = project.segments[i];
-    const canonical = readCanonicalSegmentArtifacts(projectId, segment.id);
-    const fromRun = resolveLatestSegmentDoneArtifacts(projectId, i);
-    const src = canonical ?? fromRun;
-    if (!src) {
+    if (!readCanonicalSegmentArtifacts(projectId, segment.id)) {
       throw new Error(
-        `Cannot start from clip index ${fromIndex}: missing rendered clips for segment ${i + 1}. Run from the beginning or lower the start index.`,
+        `Cannot start from clip index ${fromIndex}: missing canonical output for segment ${i + 1}. Render from the beginning or lower the start index.`,
       );
     }
-
-    const { mp4Rel, lastFrameRel } = segmentArtifactPathsInRun(i);
-    const mp4Abs = path.join(baseFolder, mp4Rel.replace(/\//g, path.sep));
-    const lastAbs = path.join(baseFolder, lastFrameRel.replace(/\//g, path.sep));
-    fs.mkdirSync(path.dirname(mp4Abs), { recursive: true });
-    fs.copyFileSync(src.mp4Abs, mp4Abs);
-    fs.copyFileSync(src.lastFrameAbs, lastAbs);
-
-    patchSegmentRunState(record, segment.id, {
-      status: "done",
-      mp4_rel: mp4Rel.replace(/\\/g, "/"),
-      last_frame_rel: lastFrameRel.replace(/\\/g, "/"),
-      error: undefined,
-    });
-    record.updated_at = new Date().toISOString();
-    saveRunRecord(projectId, record);
-    record = loadRunRecord(projectId, runId);
   }
-
-  const lastPaths = segmentArtifactPathsInRun(fromIndex - 1);
-  const chainInputAbs = path.join(
-    baseFolder,
-    lastPaths.lastFrameRel.replace(/\//g, path.sep),
-  );
-  if (!fs.existsSync(chainInputAbs)) {
-    throw new Error("Hydration failed: chain input frame missing.");
-  }
-  return { chainInputAbs };
-}
-
-export function resolveLatestSegmentDoneArtifacts(
-  projectId: string,
-  segmentIndex: number,
-): { mp4Abs: string; lastFrameAbs: string } | null {
-  const runs = listRuns(projectId);
-  runs.sort((a, b) => b.updated_at.localeCompare(a.updated_at));
-  for (const rec of runs) {
-    const st = rec.segment_states.find((s) => s.index === segmentIndex);
-    if (!st || (st.status !== "done" && st.status !== "skipped")) continue;
-    if (!st.mp4_rel || !st.last_frame_rel) continue;
-    const folder = runFolder(projectId, rec.id);
-    const mp4Abs = path.join(folder, st.mp4_rel.split("/").join(path.sep));
-    const lfAbs = path.join(folder, st.last_frame_rel.split("/").join(path.sep));
-    if (fs.existsSync(mp4Abs) && fs.existsSync(lfAbs)) {
-      return { mp4Abs, lastFrameAbs: lfAbs };
-    }
-  }
-  return null;
+  return {
+    chainInputAbs: canonicalSegmentLastFrame(
+      projectId,
+      project.segments[fromIndex - 1].id,
+    ),
+  };
 }
 
 export function deleteRunFolder(projectId: string, runId: string): void {
@@ -226,49 +176,48 @@ export function deleteRunFolder(projectId: string, runId: string): void {
   if (fs.existsSync(folder)) fs.rmSync(folder, { recursive: true });
 }
 
-/** Deletes oldest unpinned, non-active runs; keeps the `keepLatestUnpinned` most recent by updated_at. */
+function isAbPending(record: RunRecord): boolean {
+  return record.segment_states.some((s) => s.assembly_ab_pending_pick === true);
+}
+
+function ageMs(record: RunRecord): number {
+  return Date.now() - new Date(record.updated_at).getTime();
+}
+
+/**
+ * Auto-prunes unpinned terminal runs. Default: keep the most recent 20, and
+ * delete anything older than 7 days. AB-pending and active (running/paused)
+ * runs are always preserved regardless of age.
+ */
 export function pruneUnpinnedRuns(
   projectId: string,
-  options?: { keepLatestUnpinned?: number },
+  options?: { keepLatestUnpinned?: number; maxAgeDays?: number },
 ): { deleted: string[] } {
-  const keep = Math.max(0, options?.keepLatestUnpinned ?? 8);
+  const keep = Math.max(0, options?.keepLatestUnpinned ?? DEFAULT_KEEP_LATEST_UNPINNED);
+  const maxAgeDays = Math.max(0, options?.maxAgeDays ?? DEFAULT_RUN_MAX_AGE_DAYS);
+  const maxAgeMs = maxAgeDays * 24 * 60 * 60 * 1000;
   const runs = listRuns(projectId);
-  const volatile = runs.filter(
+  const candidates = runs.filter(
     (r) =>
-      !r.pinned && r.status !== "running" && r.status !== "paused",
+      !r.pinned &&
+      r.status !== "running" &&
+      r.status !== "paused" &&
+      !isAbPending(r),
   );
-  volatile.sort((a, b) => a.updated_at.localeCompare(b.updated_at));
-  const deleteCount = Math.max(0, volatile.length - keep);
-  const toDelete = volatile.slice(0, deleteCount);
+  // Newest first so we can keep the head and consider the rest for deletion.
+  candidates.sort((a, b) => b.updated_at.localeCompare(a.updated_at));
+  const overflow = candidates.slice(keep);
+  const tooOld = maxAgeMs > 0 ? candidates.filter((r) => ageMs(r) > maxAgeMs) : [];
+  const toDelete = new Set<string>([
+    ...overflow.map((r) => r.id),
+    ...tooOld.map((r) => r.id),
+  ]);
   const deleted: string[] = [];
-  for (const r of toDelete) {
-    deleteRunFolder(projectId, r.id);
-    deleted.push(r.id);
+  for (const id of toDelete) {
+    deleteRunFolder(projectId, id);
+    deleted.push(id);
   }
   return { deleted };
 }
 
 export { mergeGenerationParams as mergeParamsForSegment };
-
-export function resolveLatestPriorLastFrameAbs(
-  projectId: string,
-  priorSegmentIndex: number,
-): string | null {
-  const runs = listRuns(projectId);
-  runs.sort((a, b) => b.updated_at.localeCompare(a.updated_at));
-  for (const rec of runs) {
-    const st = rec.segment_states.find((s) => s.index === priorSegmentIndex);
-    if (
-      !st ||
-      (st.status !== "done" && st.status !== "skipped") ||
-      !st.last_frame_rel
-    )
-      continue;
-    const abs = path.join(
-      runFolder(projectId, rec.id),
-      st.last_frame_rel.split("/").join(path.sep),
-    );
-    if (fs.existsSync(abs)) return abs;
-  }
-  return null;
-}

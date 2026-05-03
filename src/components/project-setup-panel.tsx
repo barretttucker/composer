@@ -258,20 +258,10 @@ export function ProjectSetupPanel({
         <CardHeader className="pb-3">
           <CardTitle className="text-base">Chaining</CardTitle>
           <CardDescription>
-            Frame offset: negative counts from end of clip (-1 = last frame). FPS ties clip length to
-            latent frame counts on the Forge defaults tab.
+            FPS ties clip length to latent frame counts on the Forge defaults tab.
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-3">
-          <NumField
-            label="Frame offset"
-            value={chaining.frame_offset}
-            onChange={(v) =>
-              patchDraft((p) => {
-                p.chaining.frame_offset = v;
-                return p;
-              })}
-          />
           <NumField
             label="FPS"
             value={chaining.fps}
@@ -295,35 +285,18 @@ export function ProjectSetupPanel({
         </CardContent>
       </Card>
 
-      <details className="bg-card rounded-xl border shadow-sm">
-        <summary className="hover:bg-muted/30 [&::-webkit-details-marker]:hidden cursor-pointer list-none px-6 py-4">
-          <div className="flex flex-col gap-1 sm:flex-row sm:items-center sm:justify-between">
-            <span className="text-base font-semibold tracking-tight">Chain hygiene</span>
-            <span
-              className="text-muted-foreground max-w-[560px] text-xs leading-snug"
-              title="Reduces compounded softness when each clip seeds the next from an H.264 frame. Uses an earlier frame as uncompressed PNG and optionally Forge upscaler ×2 plus Lanczos downscale—WAN checkpoints stay loaded."
-            >
-              Default off for 1–3 clips; often worth enabling for longer chains (4+ segments).
-            </span>
-          </div>
-        </summary>
-        <div className="border-border space-y-4 border-t px-6 py-4">
-          <div className="flex flex-wrap items-center gap-3">
-            <div className="flex items-center gap-2">
-              <Switch
-                checked={defaults.chain_hygiene.enabled}
-                onCheckedChange={(checked) =>
-                  patchDraft((p) => {
-                    p.defaults.chain_hygiene.enabled = checked;
-                    return p;
-                  })
-                }
-              />
-              <Label className="text-sm font-normal">Enable between chained clips</Label>
-            </div>
-          </div>
+      <Card>
+        <CardHeader className="pb-3">
+          <CardTitle className="text-base">Chain seed frame</CardTitle>
+          <CardDescription>
+            How the seed for each chained clip is extracted from the previous clip. Always extracts
+            an uncompressed PNG (lossless) and optionally sharpens via Forge upscaler ×2 + Lanczos
+            downscale.
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-4">
           <NumField
-            label="Hygiene frame offset (−1 … −10)"
+            label="Frame offset (−1 … −10)"
             value={defaults.chain_hygiene.frame_offset}
             onChange={(v) =>
               patchDraft((p) => {
@@ -333,9 +306,9 @@ export function ProjectSetupPanel({
               })}
           />
           <p className="text-muted-foreground text-[11px] leading-snug">
-            Extract frame at{" "}
-            <span className="font-mono">total_frames + offset</span> into uncompressed PNG.
-            Recommended <span className="font-mono">−3</span> (avoid the weakest final WAN frame).
+            Extract frame at <span className="font-mono">total_frames + offset</span> as the seed
+            for the next chained clip. Default <span className="font-mono">−3</span> avoids the
+            weakest final WAN frame.
           </p>
           <div className="flex flex-wrap items-center gap-3">
             <div className="flex items-center gap-2">
@@ -395,8 +368,8 @@ export function ProjectSetupPanel({
                 : String(forgeUpscalersQuery.error)}
             </p>
           ) : null}
-        </div>
-      </details>
+        </CardContent>
+      </Card>
 
       </TabsContent>
 

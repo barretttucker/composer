@@ -3,7 +3,7 @@
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { AppShell } from "@/components/app-shell";
 import { ActiveProfileSubtitle } from "@/components/active-profile-subtitle";
@@ -83,13 +83,6 @@ import {
   Wand2,
 } from "lucide-react";
 import { useComposerStore } from "@/stores/composer-store";
-
-function runsFinalMp4ProjectRel(runId: string, finalRel: string): string {
-  const rel = finalRel.replace(/^\/+/, "");
-  return rel.startsWith("runs/")
-    ? rel.replace(/\\/g, "/")
-    : `runs/${runId}/${rel}`.replace(/\/+/g, "/");
-}
 
 async function fetchProject(projectId: string): Promise<{
   project: Project;
@@ -236,21 +229,46 @@ export function ComposerPanel({ projectId }: { projectId: string }) {
   });
 
   const addSegmentMutation = useMutation({
-    mutationFn: async () => {
-      const prev = draft?.segments[draft.segments.length - 1];
-      const prompt =
-        prev !== undefined && prev.prompt.trim() !== ""
-          ? prev.prompt
-          : "Describe this clip...";
+    mutationFn: async (
+      input: { mode: "extend" | "chain_from" | "fresh"; fromSegmentId?: string },
+    ) => {
+      const segs = draft?.segments ?? [];
+      let promptSeed = "Describe this clip...";
+      if (input.mode === "chain_from" && input.fromSegmentId) {
+        const src = segs.find((s) => s.id === input.fromSegmentId);
+        if (src && src.prompt.trim() !== "") promptSeed = src.prompt;
+      } else if (input.mode === "extend") {
+        const prev = segs[segs.length - 1];
+        if (prev && prev.prompt.trim() !== "") promptSeed = prev.prompt;
+      }
       const res = await fetch(`/api/projects/${projectId}/segments`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ prompt }),
+        body: JSON.stringify({
+          prompt: promptSeed,
+          mode: input.mode,
+          fromSegmentId: input.fromSegmentId,
+        }),
       });
-      if (!res.ok) throw new Error("Add segment failed");
-      return res.json() as Promise<{ project: Project }>;
+      if (!res.ok) {
+        const j = (await res.json().catch(() => ({}))) as { error?: string };
+        throw new Error(j.error ?? "Add segment failed");
+      }
+      return (await res.json()) as { project: Project; segment: { id: string } };
     },
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["project", projectId] }),
+    onSuccess: (data, vars) => {
+      setDraft(structuredClone(data.project));
+      setSelectedSegmentId(data.segment.id);
+      void qc.invalidateQueries({ queryKey: ["project", projectId] });
+      if (vars.mode === "fresh") {
+        const newIndex = data.project.segments.findIndex(
+          (s) => s.id === data.segment.id,
+        );
+        if (newIndex >= 0) {
+          requestUploadForClip(newIndex);
+        }
+      }
+    },
   });
 
   const deleteSegmentMutation = useMutation({
@@ -365,6 +383,10 @@ export function ComposerPanel({ projectId }: { projectId: string }) {
   const [selectedSegmentId, setSelectedSegmentId] = useState<string | null>(null);
   const clipFileInputRef = useRef<HTMLInputElement>(null);
   const pendingUploadClipIndex = useRef<number | null>(null);
+  const requestUploadForClip = useCallback((segmentIndex: number) => {
+    pendingUploadClipIndex.current = segmentIndex;
+    clipFileInputRef.current?.click();
+  }, []);
   const [clipPreviewNonce, setClipPreviewNonce] = useState(0);
   const previewMuted = useComposerStore((s) => s.previewMuted);
   const togglePreviewMuted = useComposerStore((s) => s.togglePreviewMuted);
@@ -432,7 +454,7 @@ export function ComposerPanel({ projectId }: { projectId: string }) {
     const sorted = [...runs].sort((a, b) => b.updated_at.localeCompare(a.updated_at));
     for (const r of sorted) {
       if (r.status === "completed" && r.final_mp4_rel) {
-        return runsFinalMp4ProjectRel(r.id, r.final_mp4_rel);
+        return r.final_mp4_rel;
       }
     }
     return null;
@@ -523,7 +545,7 @@ export function ComposerPanel({ projectId }: { projectId: string }) {
             finalRel.length > 0 &&
             activeRunId
           ) {
-            setLastCompletedMergedRel(runsFinalMp4ProjectRel(activeRunId, finalRel));
+            setLastCompletedMergedRel(finalRel);
             setPlaybackNonce((n) => n + 1);
             setPlaybackTab(segmentFinishCountRef.current === 1 ? "single" : "merged");
           }
@@ -917,14 +939,22 @@ export function ComposerPanel({ projectId }: { projectId: string }) {
           segmentHealth={projectQuery.data?.segmentRenderHealth}
           selectedId={selectedSegmentId}
           onSelect={setSelectedSegmentId}
-          onAdd={() => addSegmentMutation.mutate()}
+          onAdd={(mode) => {
+            if (mode.kind === "extend") {
+              addSegmentMutation.mutate({ mode: "extend" });
+            } else if (mode.kind === "chain_from") {
+              addSegmentMutation.mutate({
+                mode: "chain_from",
+                fromSegmentId: mode.fromSegmentId,
+              });
+            } else {
+              addSegmentMutation.mutate({ mode: "fresh" });
+            }
+          }}
           addDisabled={addSegmentMutation.isPending}
           fps={draft.chaining.fps}
           defaultClipSeconds={draft.defaults.clip_duration_seconds}
-          onRequestUploadClip={(segmentIndex) => {
-            pendingUploadClipIndex.current = segmentIndex;
-            clipFileInputRef.current?.click();
-          }}
+          onRequestUploadClip={requestUploadForClip}
           onRequestExtendFromPrevious={(segmentId) =>
             extendFromPreviousMutation.mutate(segmentId)
           }

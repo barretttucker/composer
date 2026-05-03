@@ -56,7 +56,7 @@ function project(segments: Segment[]): Project {
       seed: 1,
       chain_hygiene: { ...DEFAULT_CHAIN_HYGIENE },
     },
-    chaining: { frame_offset: -1, blend_frames: 0, fps: 16 },
+    chaining: { blend_frames: 0, fps: 16 },
     resolution: { mode: "custom", bucket: "480p", detected_aspect: null },
   } as Project);
 }

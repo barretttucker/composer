@@ -10,7 +10,6 @@ import {
   projectRoot,
   startFramePath,
 } from "@/lib/project-store";
-import { resolveLatestPriorLastFrameAbs } from "@/lib/run-store";
 import { segmentUsesChainInit } from "@/lib/schemas/project";
 
 export const runtime = "nodejs";
@@ -58,9 +57,7 @@ export async function GET(req: Request, context: Params) {
   } else {
     const prior = project.segments[ix - 1];
     const canonLf = canonicalSegmentLastFrame(projectId, prior.id);
-    candidate = fs.existsSync(canonLf)
-      ? canonLf
-      : resolveLatestPriorLastFrameAbs(projectId, ix - 1);
+    candidate = fs.existsSync(canonLf) ? canonLf : null;
   }
 
   const send = (buffer: Buffer) =>

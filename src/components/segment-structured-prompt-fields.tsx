@@ -197,10 +197,11 @@ export function SegmentStructuredPromptFields({
   const interactionSev = severityForFieldCount("interaction", interactionWc, budgets);
   const cameraWc = useDebouncedWordCount(selectedSeg.camera_intent ?? "", 200);
   const cameraSev = severityForFieldCount("camera", cameraWc, budgets);
-  const settingDesc =
-    selectedSeg.location_id?.trim() !== ""
-      ? (maps.locationsById.get(selectedSeg.location_id!.trim())?.descriptor_block ?? "")
-      : "";
+  const settingDesc = useMemo(() => {
+    const id = selectedSeg.location_id?.trim() ?? "";
+    if (id === "") return "";
+    return maps.locationsById.get(id)?.descriptor_block ?? "";
+  }, [selectedSeg.location_id, maps.locationsById]);
   const settingWc = useDebouncedWordCount(settingDesc, 200);
   const settingSev = severityForFieldCount("setting", settingWc, budgets);
 

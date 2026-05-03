@@ -5,6 +5,14 @@ import { useEffect, useRef } from "react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import {
   segmentChainSourceIndex,
   segmentUsesChainInit,
   type Project,
@@ -14,12 +22,19 @@ import type { SegmentHealthFlags } from "@/lib/segment-render-fingerprint";
 import { cn } from "@/lib/utils";
 import {
   ArrowDownFromLine,
+  ChevronDown,
   ChevronRight,
   Clapperboard,
   CornerLeftUp,
+  ImagePlus,
   Plus,
   Trash2,
 } from "lucide-react";
+
+export type AddClipMode =
+  | { kind: "extend" }
+  | { kind: "chain_from"; fromSegmentId: string }
+  | { kind: "fresh" };
 
 type SegmentSceneStripProps = {
   projectId: string;
@@ -28,7 +43,14 @@ type SegmentSceneStripProps = {
   segmentHealth?: Record<string, SegmentHealthFlags>;
   selectedId: string | null;
   onSelect: (id: string) => void;
-  onAdd: () => void;
+  /**
+   * Create a new clip at the end of the timeline.
+   *   - `extend`     chain from the current last clip (default action)
+   *   - `chain_from` chain from a specific earlier clip by stable id
+   *   - `fresh`      create with seed_frame_source = "fresh" (caller is expected to follow up
+   *                  with the upload flow on the new clip)
+   */
+  onAdd: (mode: AddClipMode) => void;
   addDisabled?: boolean;
   fps: number;
   defaultClipSeconds: number;
@@ -292,20 +314,88 @@ export function SegmentSceneStrip({
               <ChevronRight className="text-muted-foreground/50 size-4" />
             ) : null}
           </div>
-          <button
-            type="button"
-            onClick={onAdd}
-            disabled={addDisabled}
+          <div
             style={{ width: CARD_WIDTH }}
             className={cn(
-              "border-muted-foreground/30 bg-muted/20 text-muted-foreground hover:bg-muted/40 hover:text-foreground flex shrink-0 items-center justify-center rounded-lg border-2 border-dashed shadow-sm transition",
-              "min-h-[7rem] py-6 text-sm font-medium",
-              addDisabled && "cursor-not-allowed opacity-50",
+              "border-muted-foreground/30 bg-muted/20 flex shrink-0 flex-col rounded-lg border-2 border-dashed shadow-sm",
+              addDisabled && "opacity-50",
             )}
           >
-            <Plus className="mr-1.5 size-4" aria-hidden />
-            Add clip
-          </button>
+            <button
+              type="button"
+              onClick={() => onAdd({ kind: "extend" })}
+              disabled={addDisabled}
+              className={cn(
+                "text-muted-foreground hover:bg-muted/40 hover:text-foreground flex flex-1 items-center justify-center rounded-t-md py-4 text-sm font-medium transition",
+                addDisabled && "cursor-not-allowed",
+              )}
+              title={
+                segments.length === 0
+                  ? "Create the first clip"
+                  : "Add a clip that chains from the previous one"
+              }
+            >
+              <Plus className="mr-1.5 size-4" aria-hidden />
+              {segments.length === 0 ? "Add first clip" : "Add clip (extend)"}
+            </button>
+            {segments.length > 0 ? (
+              <DropdownMenu>
+                <DropdownMenuTrigger
+                  render={
+                    <button
+                      type="button"
+                      disabled={addDisabled}
+                      className={cn(
+                        "border-muted-foreground/20 text-muted-foreground hover:bg-muted/40 hover:text-foreground flex items-center justify-center rounded-b-md border-t py-1.5 text-[11px] font-medium transition",
+                        addDisabled && "cursor-not-allowed",
+                      )}
+                      title="More ways to add a clip"
+                    >
+                      More
+                      <ChevronDown className="ml-1 size-3" aria-hidden />
+                    </button>
+                  }
+                />
+                <DropdownMenuContent align="end" className="w-72">
+                  <DropdownMenuLabel>Add clip</DropdownMenuLabel>
+                  <DropdownMenuItem
+                    onSelect={() => onAdd({ kind: "extend" })}
+                    disabled={addDisabled}
+                  >
+                    <ArrowDownFromLine className="size-4 opacity-70" aria-hidden />
+                    <span className="ml-2">Extend from previous (inherits context)</span>
+                  </DropdownMenuItem>
+                  <DropdownMenuSeparator />
+                  <DropdownMenuLabel className="text-muted-foreground text-[11px] font-normal">
+                    Chain from earlier clip (inherits its context)
+                  </DropdownMenuLabel>
+                  {segments.map((s, i) => (
+                    <DropdownMenuItem
+                      key={s.id}
+                      onSelect={() => onAdd({ kind: "chain_from", fromSegmentId: s.id })}
+                      disabled={addDisabled}
+                    >
+                      <CornerLeftUp className="size-4 opacity-70" aria-hidden />
+                      <span className="ml-2 truncate">
+                        From clip {i + 1}
+                        {s.prompt.trim() !== ""
+                          ? ` — ${s.prompt.trim().slice(0, 32)}${s.prompt.trim().length > 32 ? "…" : ""}`
+                          : ""}
+                      </span>
+                    </DropdownMenuItem>
+                  ))}
+                  <DropdownMenuSeparator />
+                  <DropdownMenuItem
+                    onSelect={() => onAdd({ kind: "fresh" })}
+                    disabled={addDisabled}
+                  >
+                    <ImagePlus className="size-4 opacity-70" aria-hidden />
+                    <span className="ml-2">Fresh image — clears context</span>
+                  </DropdownMenuItem>
+                </DropdownMenuContent>
+              </DropdownMenu>
+            ) : null}
+          </div>
         </div>
 
         {segments.length === 0 ? (

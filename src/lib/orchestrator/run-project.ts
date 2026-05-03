@@ -13,14 +13,16 @@ import {
   type ForgeImg2imgRawLogRecord,
 } from "@/lib/forge/img2img-raw-log";
 import { summarizeForgeImg2imgRequestPayload } from "@/lib/forge/img2img-diagnostics";
-import {
-  extractChainFrame,
-  stitchConcat,
-} from "@/lib/ffmpeg/index";
+import { stitchConcat } from "@/lib/ffmpeg/index";
 import { applyChainHygiene } from "@/lib/orchestrator/chain_hygiene";
 import {
+  canonicalSegmentLastFrame,
+  canonicalSegmentMp4,
+  copySegmentArtifactsToCanonical,
   loadProject,
-  publishSegmentCanonicalArtifacts,
+  projectRoot,
+  promoteFileAtomic,
+  publishSegmentMetadata,
   readCanonicalSegmentArtifacts,
   resolveSegmentInitImageAbs,
   saveProject,
@@ -52,12 +54,12 @@ import {
 import { isForgeRawHttpLogEnabled } from "@/lib/env";
 import {
   createRunSkeleton,
-  hydrateRunPrefixFromPriorOutputs,
   loadRunRecord,
   runFolder,
   saveRunRecord,
-  segmentArtifactPathsInRun,
   segmentArtifactPathsInRunAb,
+  segmentScratchPathsInRun,
+  validateCanonicalPriors,
 } from "@/lib/run-store";
 import {
   segmentEffectiveMergedParams,
@@ -93,10 +95,13 @@ function isStopped(projectId: string, runId: string): boolean {
   return stoppedRuns.has(runKey(projectId, runId));
 }
 
-/** Project-root-relative path for `/api/projects/.../file?rel=`. */
-function segmentMp4RelForProjectFileApi(runId: string, i: number): string {
-  const { mp4Rel } = segmentArtifactPathsInRun(i);
-  return path.posix.join("runs", runId, mp4Rel).replace(/\\/g, "/");
+/** Canonical (project-relative) path used for broadcasts and segment_state.mp4_rel. */
+function canonicalSegmentClipRel(segmentId: string): string {
+  return path.posix.join("segment_outputs", segmentId, "clip.mp4");
+}
+
+function canonicalSegmentLastFrameRel(segmentId: string): string {
+  return path.posix.join("segment_outputs", segmentId, "last_frame.png");
 }
 
 function segmentMp4RelForProjectFileApiAb(
@@ -106,6 +111,15 @@ function segmentMp4RelForProjectFileApiAb(
 ): string {
   const { mp4Rel } = segmentArtifactPathsInRunAb(i, key);
   return path.posix.join("runs", runId, mp4Rel).replace(/\\/g, "/");
+}
+
+function segmentLastFrameRelForProjectFileApiAb(
+  runId: string,
+  i: number,
+  key: "a" | "b",
+): string {
+  const { lastFrameRel } = segmentArtifactPathsInRunAb(i, key);
+  return path.posix.join("runs", runId, lastFrameRel).replace(/\\/g, "/");
 }
 /** Dedupes poller: Forge often returns the same step/progress for many seconds while GPU-bound. */
 function forgeProgressSignature(raw: unknown): string {
@@ -255,12 +269,24 @@ async function runLoop(args: {
 
   if (fromIndex > 0) {
     try {
-      const { chainInputAbs } = hydrateRunPrefixFromPriorOutputs({
+      const { chainInputAbs } = validateCanonicalPriors({
         projectId,
-        runId,
         fromIndex,
       });
       currentInputPath = chainInputAbs;
+      // Pre-fill the segment_states for [0, fromIndex) so callers can see "this
+      // run reused canonical priors" without us having to copy any files.
+      for (let i = 0; i < fromIndex; i++) {
+        const seg = project.segments[i];
+        updateSegmentState(record, seg.id, {
+          status: "done",
+          mp4_rel: canonicalSegmentClipRel(seg.id),
+          last_frame_rel: canonicalSegmentLastFrameRel(seg.id),
+          error: undefined,
+        });
+      }
+      record.updated_at = new Date().toISOString();
+      saveRunRecord(projectId, record);
       record = loadRunRecord(projectId, runId);
       project = loadProject(projectId);
     } catch (err) {
@@ -280,18 +306,24 @@ async function runLoop(args: {
 
   for (let i = 0; i < project.segments.length; i++) {
     const segment = project.segments[i];
-    const stateIdx = record.segment_states.findIndex(
-      (s) => s.segment_id === segment.id,
+    // Scratch paths in the run folder where Forge mp4 + chain hygiene write,
+    // before being promoted to canonical via rename. Canonical paths are the
+    // permanent home and what RunRecord/broadcast consumers see.
+    const scratch = segmentScratchPathsInRun(i);
+    const scratchMp4Abs = path.join(baseFolder, scratch.mp4Rel.replace(/\//g, path.sep));
+    const scratchLastFrameAbs = path.join(
+      baseFolder,
+      scratch.lastFrameRel.replace(/\//g, path.sep),
     );
-    const { mp4Rel, lastFrameRel } = segmentArtifactPathsInRun(i);
-    const mp4Abs = path.join(baseFolder, mp4Rel.replace(/\//g, path.sep));
-    const lastFrameAbs = path.join(baseFolder, lastFrameRel.replace(/\//g, path.sep));
+    const canonicalMp4Abs = canonicalSegmentMp4(projectId, segment.id);
+    const canonicalLfAbs = canonicalSegmentLastFrame(projectId, segment.id);
+    const canonicalMp4Rel = canonicalSegmentClipRel(segment.id);
+    const canonicalLfRel = canonicalSegmentLastFrameRel(segment.id);
 
     if (i < fromIndex) {
-      const st = record.segment_states[stateIdx];
-      if (st?.status === "done" && st.mp4_rel && st.last_frame_rel) {
-        currentInputPath = path.join(baseFolder, st.last_frame_rel);
-      }
+      // Prior segments were validated as canonical at the top of the run; chain
+      // continuity reads from canonical directly.
+      if (fs.existsSync(canonicalLfAbs)) currentInputPath = canonicalLfAbs;
       continue;
     }
 
@@ -324,23 +356,25 @@ async function runLoop(args: {
     record.params_snapshot = record.params_snapshot ?? {};
     record.params_snapshot[segment.id] = merged;
 
-    if (segment.locked && fs.existsSync(mp4Abs)) {
+    if (segment.locked && fs.existsSync(canonicalMp4Abs)) {
       broadcast(projectId, runId, {
         type: "log",
-        message: `Skipping locked segment ${i} (reuse existing file)`,
+        message: `Skipping locked segment ${i} (reusing canonical output)`,
       });
+      // If the canonical lastframe is missing for some reason, regenerate it
+      // from the canonical mp4. Hygiene still needs scratch space in the run
+      // folder for intermediate PNGs.
       let hygieneTiming: Partial<
         Pick<
           SegmentRunState,
           "chain_hygiene_frame_extraction_ms" | "chain_hygiene_sharpen_ms"
         >
       > = {};
-      if (!fs.existsSync(lastFrameAbs)) {
+      if (!fs.existsSync(canonicalLfAbs)) {
         hygieneTiming = await finalizeSegmentChainLastFrame({
-          mp4Abs,
-          lastFrameAbs,
+          mp4Abs: canonicalMp4Abs,
+          lastFrameAbs: canonicalLfAbs,
           merged,
-          chainingFrameOffset: project.chaining.frame_offset,
           forgeClient: client,
           baseFolder,
           projectId,
@@ -351,8 +385,8 @@ async function runLoop(args: {
       }
       updateSegmentState(record, segment.id, {
         status: "skipped",
-        mp4_rel: mp4Rel.replace(/\\/g, "/"),
-        last_frame_rel: lastFrameRel.replace(/\\/g, "/"),
+        mp4_rel: canonicalMp4Rel,
+        last_frame_rel: canonicalLfRel,
         ...hygieneTiming,
       });
       saveRunRecord(projectId, record);
@@ -364,13 +398,10 @@ async function runLoop(args: {
         project,
         segmentIndex: i,
         chainCurrentAbs: currentInputPath,
-        runFolderAbs: baseFolder,
       });
-      publishSegmentCanonicalArtifacts({
+      publishSegmentMetadata({
         projectId,
         segmentId: segment.id,
-        mp4SourceAbs: mp4Abs,
-        lastFrameSourceAbs: lastFrameAbs,
         fingerprint: segmentRenderFingerprint(project, i),
         published: {
           assembled_prompt: posLocked,
@@ -379,19 +410,15 @@ async function runLoop(args: {
           seed_frame_rel_used: seedFrameRelUsedForSegment(project, i, resolvedLocked),
         },
       });
-      wireNextSegmentSeedAfterPublish(
-        projectId,
-        i,
-        path.posix.join("segment_outputs", segment.id, "last_frame.png"),
-      );
+      wireNextSegmentSeedAfterPublish(projectId, i, canonicalLfRel);
       project = loadProject(projectId);
       broadcast(projectId, runId, {
         type: "segment_finished",
         segmentId: segment.id,
         index: i,
-        mp4_rel: segmentMp4RelForProjectFileApi(runId, i),
+        mp4_rel: canonicalMp4Rel,
       });
-      currentInputPath = lastFrameAbs;
+      currentInputPath = canonicalLfAbs;
       continue;
     }
 
@@ -447,7 +474,6 @@ async function runLoop(args: {
           project,
           segmentIndex: i,
           chainCurrentAbs: currentInputPath,
-          runFolderAbs: baseFolder,
         });
         const initB64Ab = fs.readFileSync(resolvedInitAb).toString("base64");
 
@@ -526,7 +552,6 @@ async function runLoop(args: {
           mp4Abs: mp4AbsA,
           lastFrameAbs: lastAbsA,
           merged: mergedGen,
-          chainingFrameOffset: project.chaining.frame_offset,
           forgeClient: client,
           baseFolder,
           projectId,
@@ -538,7 +563,6 @@ async function runLoop(args: {
           mp4Abs: mp4AbsB,
           lastFrameAbs: lastAbsB,
           merged: mergedGen,
-          chainingFrameOffset: project.chaining.frame_offset,
           forgeClient: client,
           baseFolder,
           projectId,
@@ -547,12 +571,16 @@ async function runLoop(args: {
           segmentId: segment.id,
         });
 
+        const variantAMp4Rel = segmentMp4RelForProjectFileApiAb(runId, i, "a");
+        const variantALfRel = segmentLastFrameRelForProjectFileApiAb(runId, i, "a");
+        const variantBMp4Rel = segmentMp4RelForProjectFileApiAb(runId, i, "b");
+        const variantBLfRel = segmentLastFrameRelForProjectFileApiAb(runId, i, "b");
         const variants = [
           {
             key: "a" as const,
             label: `${assemblyOrderLabel(orderA)} (variant A)`,
-            mp4_rel: pathsA.mp4Rel.replace(/\\/g, "/"),
-            last_frame_rel: pathsA.lastFrameRel.replace(/\\/g, "/"),
+            mp4_rel: variantAMp4Rel,
+            last_frame_rel: variantALfRel,
             assembled_prompt: positiveA,
             order: orderA,
             seed_used: resA.seedUsed,
@@ -562,8 +590,8 @@ async function runLoop(args: {
           {
             key: "b" as const,
             label: `${assemblyOrderLabel(orderB)} (variant B)`,
-            mp4_rel: pathsB.mp4Rel.replace(/\\/g, "/"),
-            last_frame_rel: pathsB.lastFrameRel.replace(/\\/g, "/"),
+            mp4_rel: variantBMp4Rel,
+            last_frame_rel: variantBLfRel,
             assembled_prompt: positiveB,
             order: orderB,
             seed_used: resB.seedUsed,
@@ -574,8 +602,8 @@ async function runLoop(args: {
 
         updateSegmentState(record, segment.id, {
           status: "done",
-          mp4_rel: pathsA.mp4Rel.replace(/\\/g, "/"),
-          last_frame_rel: pathsA.lastFrameRel.replace(/\\/g, "/"),
+          mp4_rel: variantAMp4Rel,
+          last_frame_rel: variantALfRel,
           seed_used: resB.seedUsed,
           assembly_ab_pending_pick: true,
           assembly_ab_variants: variants,
@@ -588,7 +616,7 @@ async function runLoop(args: {
           type: "segment_finished",
           segmentId: segment.id,
           index: i,
-          mp4_rel: segmentMp4RelForProjectFileApiAb(runId, i, "a"),
+          mp4_rel: variantAMp4Rel,
           assembly_ab_pending_pick: true,
         });
 
@@ -650,7 +678,6 @@ async function runLoop(args: {
         project,
         segmentIndex: i,
         chainCurrentAbs: currentInputPath,
-        runFolderAbs: baseFolder,
       });
       const initB64 = fs.readFileSync(resolvedInit).toString("base64");
       const seedRelUsed = seedFrameRelUsedForSegment(project, i, resolvedInit);
@@ -694,17 +721,18 @@ async function runLoop(args: {
       }
       lastForgePayload = payload;
 
-      await fs.promises.mkdir(path.dirname(mp4Abs), { recursive: true });
+      // Render to scratch in the run folder; chain hygiene needs a sibling for
+      // its intermediate PNGs and expects the seg_NN.mp4 naming convention.
+      await fs.promises.mkdir(path.dirname(scratchMp4Abs), { recursive: true });
       await fs.promises.writeFile(
-        mp4Abs,
+        scratchMp4Abs,
         Buffer.from(videoBase64, "base64"),
       );
 
       const hygieneTiming = await finalizeSegmentChainLastFrame({
-        mp4Abs,
-        lastFrameAbs,
+        mp4Abs: scratchMp4Abs,
+        lastFrameAbs: scratchLastFrameAbs,
         merged,
-        chainingFrameOffset: project.chaining.frame_offset,
         forgeClient: client,
         baseFolder,
         projectId,
@@ -713,6 +741,12 @@ async function runLoop(args: {
         segmentId: segment.id,
       });
 
+      // Promote the scratch outputs straight into canonical (atomic rename
+      // when on the same filesystem). After this the run folder retains only
+      // chain-hygiene scratch PNGs / raw HTTP logs, never duplicate mp4s.
+      promoteFileAtomic(scratchMp4Abs, canonicalMp4Abs);
+      promoteFileAtomic(scratchLastFrameAbs, canonicalLfAbs);
+
       // Snapshot/publish the params actually sent to Forge (with the seed
       // used after Forge resolved any -1 to a concrete number).
       const mergedSent = mergeGenerationParams(merged, { seed: seedUsed });
@@ -720,19 +754,17 @@ async function runLoop(args: {
 
       updateSegmentState(record, segment.id, {
         status: "done",
-        mp4_rel: mp4Rel.replace(/\\/g, "/"),
-        last_frame_rel: lastFrameRel.replace(/\\/g, "/"),
+        mp4_rel: canonicalMp4Rel,
+        last_frame_rel: canonicalLfRel,
         seed_used: seedUsed,
         ...hygieneTiming,
       });
       record.updated_at = new Date().toISOString();
       saveRunRecord(projectId, record);
 
-      publishSegmentCanonicalArtifacts({
+      publishSegmentMetadata({
         projectId,
         segmentId: segment.id,
-        mp4SourceAbs: mp4Abs,
-        lastFrameSourceAbs: lastFrameAbs,
         fingerprint: segmentRenderFingerprint(project, i),
         published: {
           assembled_prompt: positivePrompt,
@@ -741,21 +773,17 @@ async function runLoop(args: {
           seed_frame_rel_used: seedRelUsed,
         },
       });
-      wireNextSegmentSeedAfterPublish(
-        projectId,
-        i,
-        path.posix.join("segment_outputs", segment.id, "last_frame.png"),
-      );
+      wireNextSegmentSeedAfterPublish(projectId, i, canonicalLfRel);
       project = loadProject(projectId);
 
       broadcast(projectId, runId, {
         type: "segment_finished",
         segmentId: segment.id,
         index: i,
-        mp4_rel: segmentMp4RelForProjectFileApi(runId, i),
+        mp4_rel: canonicalMp4Rel,
       });
 
-      currentInputPath = lastFrameAbs;
+      currentInputPath = canonicalLfAbs;
 
       if (segment.pause_for_review && pauseMode) {
         record.status = "paused";
@@ -806,27 +834,33 @@ async function runLoop(args: {
     record = loadRunRecord(projectId, runId);
   }
 
-  const doneSegments = project.segments.map((_, i) => {
+  // Stitch from canonical clips for non-AB segments; AB-pending segments fall
+  // back to the variant A scratch file in the run folder so the merged preview
+  // shows something fresh until the user picks.
+  const projectRootAbs = projectRoot(projectId);
+  const finalSources = project.segments.map((seg, i) => {
     const st = record.segment_states.find((s) => s.index === i);
     const v0 = st?.assembly_ab_variants?.[0];
     if (st?.assembly_ab_pending_pick && v0) {
-      return path.join(baseFolder, v0.mp4_rel.replace(/\//g, path.sep));
+      return path.join(projectRootAbs, v0.mp4_rel.replace(/\//g, path.sep));
     }
-    const { mp4Rel } = segmentArtifactPathsInRun(i);
-    return path.join(baseFolder, mp4Rel.replace(/\//g, path.sep));
+    return canonicalSegmentMp4(projectId, seg.id);
   });
-  const existing = doneSegments.filter((p) => fs.existsSync(p));
+  const existing = finalSources.filter((p) => fs.existsSync(p));
+  const finalRelProject = path.posix
+    .join("runs", runId, "final.mp4")
+    .replace(/\\/g, "/");
   if (existing.length > 0) {
     const finalPath = path.join(baseFolder, "final.mp4");
     await stitchConcat(existing, finalPath);
     record = loadRunRecord(projectId, runId);
-    record.final_mp4_rel = "final.mp4";
+    record.final_mp4_rel = finalRelProject;
     record.status = "completed";
     record.updated_at = new Date().toISOString();
     saveRunRecord(projectId, record);
     broadcast(projectId, runId, {
       type: "completed",
-      final_mp4_rel: "final.mp4",
+      final_mp4_rel: finalRelProject,
     });
   } else {
     record = loadRunRecord(projectId, runId);
@@ -843,7 +877,6 @@ async function finalizeSegmentChainLastFrame(opts: {
   mp4Abs: string;
   lastFrameAbs: string;
   merged: GenerationParams;
-  chainingFrameOffset: number;
   forgeClient: ForgeNeoClient;
   baseFolder: string;
   projectId: string;
@@ -859,36 +892,32 @@ async function finalizeSegmentChainLastFrame(opts: {
   >
 > {
   const ch = opts.merged.chain_hygiene;
-  if (ch.enabled) {
-    const result = await applyChainHygiene(
-      opts.mp4Abs,
-      null,
-      ch,
-      opts.baseFolder,
-      opts.forgeClient,
-    );
-    await fs.promises.copyFile(result.conditioningPath, opts.lastFrameAbs);
-    broadcast(opts.projectId, opts.runId, {
-      type: "log",
-      message: `Chain hygiene (clip ${opts.segmentIndex + 1}): frame extract ${result.frame_extraction_ms}ms${
-        result.sharpen_ms != null ? `, sharpen ${result.sharpen_ms}ms` : ""
-      }`,
-    });
-    const patch: Partial<
-      Pick<
-        SegmentRunState,
-        "chain_hygiene_frame_extraction_ms" | "chain_hygiene_sharpen_ms"
-      >
-    > = {
-      chain_hygiene_frame_extraction_ms: result.frame_extraction_ms,
-    };
-    if (result.sharpen_ms != null) {
-      patch.chain_hygiene_sharpen_ms = result.sharpen_ms;
-    }
-    return patch;
+  const result = await applyChainHygiene(
+    opts.mp4Abs,
+    null,
+    ch,
+    opts.baseFolder,
+    opts.forgeClient,
+  );
+  await fs.promises.copyFile(result.conditioningPath, opts.lastFrameAbs);
+  broadcast(opts.projectId, opts.runId, {
+    type: "log",
+    message: `Chain seed frame (clip ${opts.segmentIndex + 1}): frame extract ${result.frame_extraction_ms}ms${
+      result.sharpen_ms != null ? `, sharpen ${result.sharpen_ms}ms` : ""
+    }`,
+  });
+  const patch: Partial<
+    Pick<
+      SegmentRunState,
+      "chain_hygiene_frame_extraction_ms" | "chain_hygiene_sharpen_ms"
+    >
+  > = {
+    chain_hygiene_frame_extraction_ms: result.frame_extraction_ms,
+  };
+  if (result.sharpen_ms != null) {
+    patch.chain_hygiene_sharpen_ms = result.sharpen_ms;
   }
-  await extractChainFrame(opts.mp4Abs, opts.chainingFrameOffset, opts.lastFrameAbs);
-  return {};
+  return patch;
 }
 
 function updateSegmentState(
@@ -929,9 +958,12 @@ export function pickAssemblyAbVariant(params: {
   if (!picked) {
     throw new Error(`Unknown variant ${variant}`);
   }
-  const baseFolder = runFolder(projectId, runId);
-  const mp4Abs = path.join(baseFolder, picked.mp4_rel.replace(/\//g, path.sep));
-  const lfAbs = path.join(baseFolder, picked.last_frame_rel.replace(/\//g, path.sep));
+  const projectRootAbs = projectRoot(projectId);
+  const mp4Abs = path.join(projectRootAbs, picked.mp4_rel.replace(/\//g, path.sep));
+  const lfAbs = path.join(
+    projectRootAbs,
+    picked.last_frame_rel.replace(/\//g, path.sep),
+  );
   if (!fs.existsSync(mp4Abs) || !fs.existsSync(lfAbs)) {
     throw new Error("Chosen variant media files are missing from the run folder.");
   }
@@ -975,9 +1007,6 @@ export function pickAssemblyAbVariant(params: {
 
   let chainCurrentAbs = startFramePath(projectId);
   if (segIndex > 0) {
-    // Default fallback: the immediate previous clip. The resolver may instead pick a
-    // chained_from source, which is fine because resolveSegmentInitImageAbs handles
-    // that case (preferring the in-run copy when present).
     const prev = project.segments[segIndex - 1]!;
     const canon = readCanonicalSegmentArtifacts(projectId, prev.id);
     if (canon) {
@@ -994,16 +1023,21 @@ export function pickAssemblyAbVariant(params: {
     project,
     segmentIndex: segIndex,
     chainCurrentAbs,
-    runFolderAbs: baseFolder,
   });
   const seedRelUsed = seedFrameRelUsedForSegment(project, segIndex, resolvedInit);
   const neg = assembleNegativePrompt(segment, project);
 
-  publishSegmentCanonicalArtifacts({
+  // Promote the chosen variant to canonical (copy because the source still
+  // lives in the run folder; we delete the loser variant after).
+  copySegmentArtifactsToCanonical({
     projectId,
     segmentId,
     mp4SourceAbs: mp4Abs,
     lastFrameSourceAbs: lfAbs,
+  });
+  publishSegmentMetadata({
+    projectId,
+    segmentId,
     fingerprint: segmentRenderFingerprint(project, segIndex),
     published: {
       assembled_prompt: picked.assembled_prompt,
@@ -1013,17 +1047,31 @@ export function pickAssemblyAbVariant(params: {
     },
   });
 
+  // Clean up the unchosen variant's media so the run folder doesn't keep dead
+  // files around. The chosen variant still lives under the run folder too — it
+  // gets garbage collected when the run is pruned.
+  for (const v of st.assembly_ab_variants) {
+    if (v.key === picked.key) continue;
+    const loserMp4 = path.join(projectRootAbs, v.mp4_rel.replace(/\//g, path.sep));
+    const loserLf = path.join(
+      projectRootAbs,
+      v.last_frame_rel.replace(/\//g, path.sep),
+    );
+    if (fs.existsSync(loserMp4)) fs.unlinkSync(loserMp4);
+    if (fs.existsSync(loserLf)) fs.unlinkSync(loserLf);
+  }
+
   wireNextSegmentSeedAfterPublish(
     projectId,
     segIndex,
-    path.posix.join("segment_outputs", segmentId, "last_frame.png"),
+    canonicalSegmentLastFrameRel(segmentId),
   );
 
   updateSegmentState(record, segmentId, {
     assembly_ab_pending_pick: undefined,
     assembly_ab_variants: undefined,
-    mp4_rel: picked.mp4_rel.replace(/\\/g, "/"),
-    last_frame_rel: picked.last_frame_rel.replace(/\\/g, "/"),
+    mp4_rel: canonicalSegmentClipRel(segmentId),
+    last_frame_rel: canonicalSegmentLastFrameRel(segmentId),
     seed_used: picked.seed_used,
   });
   record.updated_at = new Date().toISOString();
